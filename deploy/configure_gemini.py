@@ -61,6 +61,7 @@ def main():
     print('결제 계정을 연결하지 마세요. 이 도구는 결제·구독을 활성화하지 않습니다.')
     print('무료 이용 여부·한도는 Google 정책과 프로젝트에 따라 다릅니다. 일일 호출 제한만으로 무료가 보장되지는 않습니다.')
     print('공개 기사 제목·발췌를 Google로 전송하며 개인정보·수동 기록은 보내지 않습니다.')
+    print('모델별 일일 할당량 소진 시 gemini-2.5-flash-lite로 대체하며, 전체 호출은 하루 최대 4회입니다.')
     model = input(f'Gemini model [Enter: {gemini.DEFAULT_MODEL}]: ').strip() or gemini.DEFAULT_MODEL
     if not gemini.valid_model(model):
         raise SystemExit('모델 이름을 확인하세요. 설정을 변경하지 않았습니다.')

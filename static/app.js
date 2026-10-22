@@ -74,16 +74,17 @@ function renderAIBriefing() {
   const expanded = new Set($$('#ai-briefing details[open]').map(node=>node.dataset.record));
   const ai = demo ? null : data.gemini;
   const brief = ai?.briefing;
+  const retryNote = ai?.retry_at && ai.status==='error' ? ` 다음 생성 시도 가능: ${dateText(ai.retry_at,{hour:'2-digit',minute:'2-digit'})} KST. 시간이 지난 뒤 ‘지금 수집하기’를 눌러 주세요.` : '';
   $('#highlights').hidden = !!brief;
   $('#briefing-basis').textContent = brief ? 'Gemini 한국어 요약 · 출처 함께 확인' : '최근 72시간 · 제목 기반 핵심 기사';
   if (!brief) {
-    $('#ai-briefing').innerHTML = !demo && ai ? `<p class="ai-status" role="status">${esc(ai.message)}</p>` : '';
+    $('#ai-briefing').innerHTML = !demo && ai ? `<p class="ai-status" role="status">${esc(ai.message+retryNote)}</p>` : '';
     return;
   }
   const old = ai.status !== 'ready' || Date.now()-new Date(brief.generated_at).getTime()>24*3600*1000;
-  const sourceLinks = (item,id) => `<details class="ai-sources" data-record="${id}" ${expanded.has(id)?'open':''}><summary>출처 ${item.sources.length}건 · ${item.basis==='title'?'제목 기반':'공개 발췌·제목 기반'}</summary>${item.sources.map(s=>link(s.url,`${esc(s.source)} · ${esc(s.title)} ↗`)).join('')}</details>`;
+  const sourceLinks = (item,id) => !item.sources.length ? '<p class="ai-sources">확인 필요 · 검사를 통과한 기업별 요약이 없습니다.</p>' : `<details class="ai-sources" data-record="${id}" ${expanded.has(id)?'open':''}><summary>출처 ${item.sources.length}건 · ${item.basis==='title'?'제목 기반':'공개 발췌·제목 기반'}</summary>${item.sources.map(s=>link(s.url,`${esc(s.source)} · ${esc(s.title)} ↗`)).join('')}</details>`;
   const content = (item,id) => `<h4>${esc(item.title)}</h4><p class="ai-summary">${esc(item.summary)}</p><dl><dt>의미</dt><dd>${esc(item.why_it_matters)}</dd><dt>다음 확인</dt><dd>${esc(item.watch_next)}</dd></dl>${sourceLinks(item,id)}`;
-  $('#ai-briefing').innerHTML = `<div class="ai-intro"><div><span class="ai-label">AI BRIEF${old?' · 이전 요약':''}</span><h3>${esc(brief.headline)}</h3></div><span class="ai-updated">${dateText(brief.generated_at,{hour:'2-digit',minute:'2-digit'})} KST 생성</span></div>${old?`<p class="ai-status" role="status">${esc(ai.status==='ready'?'새 자료가 수집되면 요약을 갱신합니다.':ai.message)} 기존 요약을 표시합니다.</p>`:''}<div class="ai-highlights">${brief.highlights.map((item,i)=>`<article class="ai-card"><span class="ai-number">0${i+1}</span>${content(item,'highlight-'+i)}</article>`).join('')}</div><div class="ai-companies">${brief.companies.map(item=>`<article class="ai-card ai-company"><span class="ai-company-name">${esc(companies[item.company])}</span>${content(item,'company-'+item.company)}</article>`).join('')}</div><p class="footnote ai-footnote">수집된 공개 자료를 AI가 정리한 내용입니다. 제목 기반 요약은 기사 본문을 확인한 결과가 아닙니다. 수치와 해석은 연결된 원문에서 확인하세요.</p>`;
+  $('#ai-briefing').innerHTML = `<div class="ai-intro"><div><span class="ai-label">AI BRIEF${old?' · 이전 요약':''}${brief.model===ai.fallback_model&&brief.model!==ai.model?' · Flash Lite 대체':''}</span><h3>${esc(brief.headline)}</h3></div><span class="ai-updated">${dateText(brief.generated_at,{hour:'2-digit',minute:'2-digit'})} KST 생성</span></div>${old?`<p class="ai-status" role="status">${esc(ai.status==='ready'?'새 자료가 수집되면 요약을 갱신합니다.':ai.message+retryNote)} 기존 요약을 표시합니다.</p>`:''}${brief.warnings?.length?'<p class="ai-status">일부 요약이 출처·수치·형식 검사에 실패해 제외되거나 ‘확인 필요’로 표시됐습니다. 검사를 통과한 내용만 표시합니다.</p>':''}<div class="ai-highlights">${brief.highlights.map((item,i)=>`<article class="ai-card"><span class="ai-number">0${i+1}</span>${content(item,'highlight-'+i)}</article>`).join('')}</div><div class="ai-companies">${brief.companies.map(item=>`<article class="ai-card ai-company"><span class="ai-company-name">${esc(companies[item.company])}</span>${content(item,'company-'+item.company)}</article>`).join('')}</div><p class="footnote ai-footnote">수집된 공개 자료를 AI가 정리한 내용입니다. 제목 기반 요약은 기사 본문을 확인한 결과가 아닙니다. 수치와 해석은 연결된 원문에서 확인하세요.</p>`;
 }
 function renderTargets(targets) {
   const expanded = new Set($$('#targets details[open]').map(node=>node.dataset.record));

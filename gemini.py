@@ -7,8 +7,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = '1'
+VERSION = '2'
 DEFAULT_MODEL = 'gemini-3.5-flash-lite'
+FALLBACK_MODEL = 'gemini-2.5-flash-lite'
 KST = timezone(timedelta(hours=9))
 API = 'https://generativelanguage.googleapis.com/v1beta/models/'
 COMPANIES = {'samsung', 'sk'}
@@ -31,7 +32,16 @@ companies 항목에는 company(samsung 또는 sk)도 포함한다. 해당 기업
 
 
 class GeminiError(Exception):
-    pass
+    def __init__(self, message, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic or {}
+
+
+class OutputError(ValueError):
+    def __init__(self, code, issues=None):
+        super().__init__(code)
+        self.code = code
+        self.issues = issues or []
 
 
 def config():
@@ -54,6 +64,27 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise GeminiError('API 주소가 변경되어 요청을 중단했습니다.')
 
 
+def daily_model_quota(error):
+    """Inspect only structured daily, per-model quota identifiers; never echo bodies."""
+    try:
+        body = error.read(65537)
+        if len(body)>65536:return False
+        details = json.loads(body).get('error',{}).get('details',[])
+        for detail in details:
+            if not isinstance(detail,dict) or detail.get('@type')!='type.googleapis.com/google.rpc.QuotaFailure':
+                continue
+            for violation in detail.get('violations',[]):
+                if not isinstance(violation,dict):continue
+                identifier = str(violation.get('quotaId','')).lower()
+                dimensions = violation.get('quotaDimensions',{})
+                per_model = 'permodel' in identifier or isinstance(dimensions,dict) and bool(dimensions.get('model'))
+                if re.search(r'perday|per_day|daily',identifier) and per_model:
+                    return True
+    except (ValueError,TypeError,AttributeError,OSError):
+        pass
+    return False
+
+
 def api_request(key, model, payload=None):
     if not valid_model(model):
         raise GeminiError('Gemini 모델 설정을 확인하세요.')
@@ -68,11 +99,14 @@ def api_request(key, model, payload=None):
             raise GeminiError('Gemini 응답 크기 제한을 초과했습니다.')
         return json.loads(data)
     except urllib.error.HTTPError as error:
+        if error.code==429 and daily_model_quota(error):
+            raise GeminiError('Gemini 모델의 일일 할당량을 모두 사용했습니다.',{'code':'daily_model_quota'}) from None
         messages = {400:'API 키·모델·요청 형식을 확인하세요.',
                     401:'Gemini API 키를 확인하세요.', 403:'API 키 권한과 이용 가능 지역을 확인하세요.',
                     404:'선택한 Gemini 모델을 사용할 수 없습니다.',
                     429:'Gemini 무료 한도 또는 요청 제한에 도달했습니다. 다음 수집 때 다시 시도합니다.'}
-        raise GeminiError(messages.get(error.code, 'Gemini 서비스 응답 오류입니다. 다음 수집 때 다시 시도합니다.')) from None
+        raise GeminiError(messages.get(error.code, 'Gemini 서비스 응답 오류입니다. 다음 수집 때 다시 시도합니다.'),
+                          {'code':'http_'+str(error.code) if error.code in messages else 'http_error'}) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise GeminiError('Gemini 연결이 지연되어 기존 브리핑을 유지합니다.') from None
     except (ValueError, TypeError):
@@ -137,14 +171,18 @@ def sources_for(connect, current):
     return selected
 
 
-def schema():
+def schema(sources=None):
     fields = {key:{'type':'STRING'} for key in ['title','summary','why_it_matters','watch_next']}
-    fields['source_ids'] = {'type':'ARRAY','items':{'type':'STRING'}}
+    source_id = {'type':'STRING'}
+    if sources:
+        source_id['enum'] = [s['id'] for s in sources]
+    fields['source_ids'] = {'type':'ARRAY','items':source_id,'minItems':1,'maxItems':3}
     item = {'type':'OBJECT','properties':fields,'required':list(fields)}
     company = {'type':'OBJECT','properties':{**fields,'company':{'type':'STRING','enum':['samsung','sk']}},
                'required':list(fields)+['company']}
     return {'type':'OBJECT','properties':{'headline':{'type':'STRING'},
-        'highlights':{'type':'ARRAY','items':item},'companies':{'type':'ARRAY','items':company}},
+        'highlights':{'type':'ARRAY','items':item,'minItems':1,'maxItems':3},
+        'companies':{'type':'ARRAY','items':company,'minItems':1,'maxItems':2}},
         'required':['headline','highlights','companies']}
 
 
@@ -152,29 +190,34 @@ def numbers(text):
     return {n.replace(',','') for n in re.findall(r'\d[\d,]*(?:\.\d+)?', text)}
 
 
-def validate_output(value, sources):
+def validate_output(value, sources, partial=False):
     if not isinstance(value, dict):
-        raise ValueError('Invalid briefing')
+        raise OutputError('invalid_briefing')
     source_map = {s['id']:s for s in sources}
-    def clean_text(value, limit):
-        if not isinstance(value,str) or not value.strip() or len(value)>limit or not re.search('[가-힣]',value):
-            raise ValueError('Missing Korean text')
+    warnings = []
+    def clean_text(value, limit, korean=True):
+        if not isinstance(value,str) or not value.strip():
+            raise OutputError('missing_text')
+        if len(value)>limit:
+            raise OutputError('text_too_long')
+        if korean and not re.search('[가-힣]',value):
+            raise OutputError('missing_korean_text')
         return value.strip()
     def item(raw, company=False):
         if not isinstance(raw,dict):
-            raise ValueError('Invalid item')
+            raise OutputError('invalid_item')
         ids = raw.get('source_ids')
         if not isinstance(ids,list) or not 1<=len(ids)<=3 or any(not isinstance(i,str) or i not in source_map for i in ids):
-            raise ValueError('Unrecognized source')
+            raise OutputError('unrecognized_source')
         refs = [source_map[i] for i in dict.fromkeys(ids)]
-        result = {k:clean_text(raw.get(k),limit) for k,limit in
+        result = {k:clean_text(raw.get(k),limit,k!='title') for k,limit in
                   [('title',100),('summary',400),('why_it_matters',300),('watch_next',220)]}
         if not numbers(' '.join(result.values())) <= numbers(' '.join(s['title']+' '+s['excerpt'] for s in refs)):
-            raise ValueError('Unsupported numeric claim')
+            raise OutputError('unsupported_numeric_claim')
         if company:
             key = raw.get('company')
             if key not in COMPANIES or any(key not in s['companies'] for s in refs):
-                raise ValueError('Wrong company source')
+                raise OutputError('wrong_company_source')
             result['company'] = key
         result['sources'] = [dict(id=s['id'],title=s['title'],url=s['url'],source=s['source'],
                                   published=s['published'],basis=s['basis']) for s in refs]
@@ -182,34 +225,71 @@ def validate_output(value, sources):
         return result
     highlights, companies = value.get('highlights'),value.get('companies')
     if not isinstance(highlights,list) or not 1<=len(highlights)<=3 or not isinstance(companies,list) or len(companies)>2:
-        raise ValueError('Invalid item count')
-    result = dict(headline=clean_text(value.get('headline'),180),
-                  highlights=[item(i) for i in highlights],companies=[item(i,True) for i in companies])
-    if len({i['company'] for i in result['companies']}) != len(result['companies']):
-        raise ValueError('Duplicate company')
-    if {i['company'] for i in result['companies']} != {company for s in sources for company in s['companies']}:
-        raise ValueError('Missing company briefing')
-    if not numbers(result['headline']) <= numbers(' '.join(s['title']+' '+s['excerpt'] for s in sources)):
-        raise ValueError('Unsupported headline figure')
+        raise OutputError('invalid_item_count')
+    try:
+        headline = clean_text(value.get('headline'),180)
+        if not numbers(headline) <= numbers(' '.join(s['title']+' '+s['excerpt'] for s in sources)):
+            raise OutputError('unsupported_headline_figure')
+    except OutputError as error:
+        if not partial:raise
+        headline = '공개 자료에서 확인된 반도체 주요 소식입니다.'
+        warnings.append('headline:'+error.code)
+    result = dict(headline=headline,highlights=[],companies=[])
+    for name, rows in [('highlights',highlights),('companies',companies)]:
+        for index, row in enumerate(rows):
+            try:
+                result[name].append(item(row,name=='companies'))
+            except OutputError as error:
+                if not partial:raise
+                warnings.append(name+':'+str(index)+':'+error.code)
+    company_keys = [i['company'] for i in result['companies']]
+    if len(set(company_keys)) != len(company_keys):
+        raise OutputError('duplicate_company')
+    expected = {company for s in sources for company in s['companies']}
+    if not result['highlights'] and not result['companies']:
+        raise OutputError('no_verified_items',warnings)
+    if set(company_keys) != expected:
+        if not partial:raise OutputError('missing_company_briefing')
+        for company in sorted(expected-set(company_keys)):
+            warnings.append('companies:'+company+':missing_company_briefing')
+            result['companies'].append(dict(company=company,title='확인 필요',
+                summary='이번 응답에서 검사를 통과한 기업별 요약을 확인하지 못했습니다.',
+                why_it_matters='확인되지 않은 내용은 추정하지 않고 비워 두었습니다.',
+                watch_next='기업 관련 원문을 직접 확인하세요.',sources=[],basis='unverified'))
+    if warnings:
+        result['warnings'] = warnings
     return result
 
 
 def generate(key, model, sources):
     # Source URLs are attached by the server after validation, not generated by the model.
     public_input = [{key:value for key,value in source.items() if key!='url'} for source in sources]
+    generation = {'temperature':0.2,'maxOutputTokens':4096,
+                  'responseMimeType':'application/json','responseSchema':schema(sources)}
+    if model.startswith('gemini-2.5-flash'):
+        # Flash 2.5 includes thinking in maxOutputTokens. This short extraction task
+        # does not require it; an unconstrained default can exhaust the JSON budget.
+        generation['thinkingConfig'] = {'thinkingBudget':0}
     payload = {'systemInstruction':{'parts':[{'text':PROMPT}]},
         'contents':[{'role':'user','parts':[{'text':json.dumps({'sources':public_input},ensure_ascii=False)}]}],
-        'generationConfig':{'temperature':0.2,'maxOutputTokens':4096,
-                            'responseMimeType':'application/json','responseSchema':schema()}}
+        'generationConfig':generation}
     data = api_request(key, model, payload)
     try:
         candidates = data['candidates']
-        if candidates[0].get('finishReason') != 'STOP':
-            raise ValueError('Incomplete response')
+        reason = candidates[0].get('finishReason')
+        if reason != 'STOP':
+            code = reason if reason in {'MAX_TOKENS','SAFETY','RECITATION','BLOCKLIST','PROHIBITED_CONTENT','OTHER'} else 'UNKNOWN'
+            message = 'Gemini 출력 한도에 도달해 요약이 중단됐습니다.' if code=='MAX_TOKENS' else 'Gemini가 완성된 요약을 반환하지 않았습니다.'
+            raise GeminiError(message+' 기존 브리핑을 유지합니다.',{'code':'finish_'+code})
         text = ''.join(part.get('text','') for part in candidates[0]['content']['parts'] if not part.get('thought'))
-        return validate_output(json.loads(text),sources)
+        return validate_output(json.loads(text),sources,partial=True)
+    except OutputError as error:
+        raise GeminiError('출처·수치·구성을 확인할 수 있는 요약이 없어 기존 브리핑을 유지합니다.',
+                          {'code':error.code,'checks':error.issues[:8]}) from None
+    except json.JSONDecodeError:
+        raise GeminiError('Gemini가 올바른 JSON 형식으로 응답하지 않았습니다. 기존 브리핑을 유지합니다.',{'code':'invalid_json'}) from None
     except (KeyError, IndexError, ValueError, TypeError, AttributeError):
-        raise GeminiError('출처·수치·응답 형식 확인을 통과하지 못해 기존 브리핑을 유지합니다.') from None
+        raise GeminiError('Gemini 응답에 필요한 항목이 없습니다. 기존 브리핑을 유지합니다.',{'code':'missing_response_fields'}) from None
 
 
 def refresh(connect, current=None):
@@ -225,8 +305,13 @@ def refresh(connect, current=None):
     fingerprint = hashlib.sha256(json.dumps([VERSION,settings['model'],current.astimezone(KST).date().isoformat(),sources],
                                             ensure_ascii=False,sort_keys=True).encode()).hexdigest()
     budget_key = 'gemini_budget_'+current.astimezone(KST).date().isoformat()
+    route_key = 'gemini_model_'+current.astimezone(KST).date().isoformat()
+    model = settings['model']
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
+        route = read_setting(db,route_key,{})
+        if route.get('primary')==model and route.get('active') in {model,FALLBACK_MODEL}:
+            model = route['active']
         cached = read_setting(db,'gemini_briefing',{})
         if cached.get('fingerprint') == fingerprint:
             state = read_setting(db,'gemini_state',{})
@@ -234,6 +319,11 @@ def refresh(connect, current=None):
                                                 last_attempt=state.get('last_attempt')))
             return {'status':'cached'}
         state = read_setting(db,'gemini_state',{})
+        if route.get('primary')==settings['model'] and route.get('exhausted'):
+            write_setting(db,'gemini_state',dict(status='provider_daily_limit',
+                message='사용 가능한 모델의 일일 할당량이 소진됐습니다. 기존 브리핑을 유지하고 다음 날 다시 확인합니다.',
+                last_attempt=state.get('last_attempt'),diagnostic={'code':'all_models_daily_quota'}))
+            return {'status':'provider_daily_limit'}
         if state.get('last_attempt') and (current-datetime.fromisoformat(state['last_attempt'])).total_seconds()<900:
             return {'status':'cooldown'}
         attempts = read_setting(db,budget_key,0)
@@ -244,8 +334,26 @@ def refresh(connect, current=None):
         write_setting(db,budget_key,attempts+1)
         write_setting(db,'gemini_state',dict(status='generating',message='새로운 자료를 한국어로 정리하고 있습니다.',last_attempt=current.isoformat()))
     try:
-        briefing = generate(settings['key'],settings['model'],sources)
-        briefing.update(generated_at=current.isoformat(),model=settings['model'],fingerprint=fingerprint,
+        try:
+            briefing = generate(settings['key'],model,sources)
+        except GeminiError as error:
+            if error.diagnostic.get('code')!='daily_model_quota' or model==FALLBACK_MODEL:
+                raise
+            with connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                write_setting(db,route_key,dict(primary=settings['model'],active=FALLBACK_MODEL,exhausted=False))
+                attempts = read_setting(db,budget_key,0)
+                if attempts>=DAILY_LIMIT:
+                    write_setting(db,'gemini_state',dict(status='daily_limit',
+                        message='기본 모델의 일일 할당량이 소진됐고, 오늘의 앱 호출 제한으로 대체 모델을 호출하지 않았습니다.',
+                        last_attempt=current.isoformat(),diagnostic={'code':'fallback_budget_exhausted'}))
+                    return {'status':'daily_limit'}
+                write_setting(db,budget_key,attempts+1)
+                write_setting(db,'gemini_state',dict(status='generating',
+                    message='기본 모델의 일일 할당량이 소진되어 Flash Lite로 정리하고 있습니다.',last_attempt=current.isoformat()))
+            model=FALLBACK_MODEL
+            briefing=generate(settings['key'],model,sources)
+        briefing.update(generated_at=current.isoformat(),model=model,fingerprint=fingerprint,
                         source_count=len(sources),version=VERSION)
         with connect() as db:
             write_setting(db,'gemini_briefing',briefing)
@@ -253,9 +361,16 @@ def refresh(connect, current=None):
         return {'status':'ready'}
     except Exception as error:
         message = str(error) if isinstance(error,GeminiError) else 'AI 요약 생성 중 오류가 발생해 기존 브리핑을 유지합니다.'
+        diagnostic = error.diagnostic if isinstance(error,GeminiError) else {'code':'internal_error'}
+        provider_daily = diagnostic.get('code')=='daily_model_quota' and model==FALLBACK_MODEL
+        status = 'provider_daily_limit' if provider_daily else 'error'
+        if provider_daily:
+            message='사용 가능한 모델의 일일 할당량이 소진됐습니다. 기존 브리핑을 유지하고 다음 날 다시 확인합니다.'
         with connect() as db:
-            write_setting(db,'gemini_state',dict(status='error',message=message,last_attempt=current.isoformat()))
-        return {'status':'error'}
+            if provider_daily:
+                write_setting(db,route_key,dict(primary=settings['model'],active=model,exhausted=True))
+            write_setting(db,'gemini_state',dict(status=status,message=message,last_attempt=current.isoformat(),diagnostic=diagnostic))
+        return {'status':status}
 
 
 def snapshot(connect):
@@ -268,5 +383,19 @@ def snapshot(connect):
                     message='Gemini 연결 전입니다. 현재는 원문 제목을 표시합니다.',briefing=None)
     if briefing:
         briefing = {key:value for key,value in briefing.items() if key!='fingerprint'}
+    current = datetime.now(timezone.utc)
+    with connect() as db:
+        attempts = read_setting(db,'gemini_budget_'+current.astimezone(KST).date().isoformat(),0)
+        route = read_setting(db,'gemini_model_'+current.astimezone(KST).date().isoformat(),{})
+    active = route.get('active') if route.get('primary')==settings['model'] else settings['model']
+    if active not in {settings['model'],FALLBACK_MODEL}:active=settings['model']
+    retry_at = None
+    if state.get('last_attempt'):
+        retry = datetime.fromisoformat(state['last_attempt'])+timedelta(minutes=15)
+        if retry>current:retry_at=retry.isoformat()
     return dict(enabled=True,configured=True,status=state.get('status','waiting'),
-                message=state.get('message','다음 자료 수집 때 AI 요약을 생성합니다.'),briefing=briefing)
+                message=state.get('message','다음 자료 수집 때 AI 요약을 생성합니다.'),briefing=briefing,
+                model=settings['model'] if valid_model(settings['model']) else 'invalid',
+                active_model=active if valid_model(active) else 'invalid',fallback_model=FALLBACK_MODEL,
+                diagnostic=state.get('diagnostic',{}),attempts_today=attempts,daily_limit=DAILY_LIMIT,
+                retry_at=retry_at)

@@ -128,6 +128,104 @@ class GeminiTests(unittest.TestCase):
             with patch('gemini.api_request',return_value={'candidates':candidates}),self.assertRaises(gemini.GeminiError):
                 gemini.generate(KEY,gemini.DEFAULT_MODEL,sources)
 
+    def test_flash_25_uses_no_thinking_and_schema_limits_source_ids(self):
+        sources=[source()]
+        reply={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(output(sources))}]}}]}
+        for model in ['gemini-2.5-flash','gemini-2.5-flash-lite','gemini-3.5-flash-lite']:
+            with patch('gemini.api_request',return_value=reply) as request:
+                gemini.generate(KEY,model,sources)
+                generation=request.call_args.args[2]['generationConfig']
+            if model.startswith('gemini-2.5'):
+                self.assertEqual(generation['thinkingConfig'],{'thinkingBudget':0})
+            else:self.assertNotIn('thinkingConfig',generation)
+            ids=generation['responseSchema']['properties']['highlights']['items']['properties']['source_ids']
+            self.assertEqual(ids['items']['enum'],['S1'])
+
+    def test_acronym_title_and_partial_verified_cards_survive_bad_sibling_card(self):
+        sources=[source(),source('S2','sk','SK하이닉스 HBM 공급 계획')]
+        raw=output(sources);raw['highlights'][0]['title']='HBM · DRAM'
+        invalid=dict(raw['highlights'][0],summary='목표가가 999만원입니다.')
+        raw['highlights'].append(invalid)
+        raw['companies'][1]['source_ids']=['S1']
+        result=gemini.validate_output(raw,sources,partial=True)
+        self.assertEqual(len(result['highlights']),1)
+        self.assertEqual(result['highlights'][0]['title'],'HBM · DRAM')
+        missing=next(c for c in result['companies'] if c['company']=='sk')
+        self.assertEqual(missing['title'],'확인 필요');self.assertEqual(missing['sources'],[])
+        self.assertNotIn('999',json.dumps(result))
+        self.assertIn('highlights:1:unsupported_numeric_claim',result['warnings'])
+
+    def test_finish_reason_and_failed_checks_are_diagnosable_without_raw_response(self):
+        sources=[source()]
+        raw=output(sources)
+        for item in raw['highlights']+raw['companies']:item['source_ids']=['NOT_A_SOURCE_'+KEY]
+        replies=[({'candidates':[{'finishReason':'MAX_TOKENS'}]},'finish_MAX_TOKENS'),
+                 ({'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':'bad '+KEY}]}}]},'invalid_json'),
+                 ({'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(raw)}]}}]},'no_verified_items')]
+        for reply,code in replies:
+            with patch('gemini.api_request',return_value=reply),self.assertRaises(gemini.GeminiError) as caught:
+                gemini.generate(KEY,'gemini-2.5-flash',sources)
+            self.assertEqual(caught.exception.diagnostic['code'],code)
+            self.assertNotIn(KEY,str(caught.exception)+json.dumps(caught.exception.diagnostic))
+            if code=='no_verified_items':self.assertIn('highlights:0:unrecognized_source',caught.exception.diagnostic['checks'])
+
+    def test_only_structured_daily_per_model_quota_is_eligible_for_fallback(self):
+        for quota_id,dimensions,eligible in [
+            ('GenerateRequestsPerDayPerProjectPerModel-FreeTier',{},True),
+            ('RequestsPerDay',{'model':'gemini-2.5-flash'},True),
+            ('GenerateRequestsPerMinutePerProjectPerModel-FreeTier',{},False),
+            ('RequestsPerDayPerProject',{},False)]:
+            data={'error':{'details':[{'@type':'type.googleapis.com/google.rpc.QuotaFailure','violations':[
+                {'quotaId':quota_id,'quotaDimensions':dimensions}]}]}}
+            error=urllib.error.HTTPError(gemini.API,429,KEY,{},io.BytesIO(json.dumps(data).encode()))
+            with patch('gemini.urllib.request.build_opener') as opener:
+                opener.return_value.open.side_effect=error
+                with self.assertRaises(gemini.GeminiError) as caught:gemini.api_request(KEY,'gemini-2.5-flash',{})
+            self.assertEqual(caught.exception.diagnostic['code']=='daily_model_quota',eligible)
+            self.assertNotIn(KEY,str(caught.exception))
+
+    def test_daily_quota_falls_back_once_and_routes_later_calls_to_lite_then_resets_next_day(self):
+        sources=[source()];good=gemini.validate_output(output(sources),sources)
+        quota=gemini.GeminiError('일일 모델 한도',{'code':'daily_model_quota'})
+        with patch.dict(os.environ,{'GEMINI_MODEL':'gemini-2.5-flash'}),patch('gemini.sources_for',return_value=sources),patch('gemini.generate',side_effect=[quota,good,good,good]) as request:
+            self.assertEqual(gemini.refresh(app.connect,CURRENT)['status'],'ready')
+            self.assertEqual([c.args[1] for c in request.call_args_list],['gemini-2.5-flash',gemini.FALLBACK_MODEL])
+            self.assertEqual(gemini.refresh(app.connect,CURRENT+timedelta(minutes=1))['status'],'cached')
+            sources[0]['title']='삼성전자 공급 계획 후속 소식'
+            self.assertEqual(gemini.refresh(app.connect,CURRENT+timedelta(minutes=20))['status'],'ready')
+            self.assertEqual(request.call_args.args[1],gemini.FALLBACK_MODEL)
+            self.assertEqual(gemini.refresh(app.connect,CURRENT+timedelta(days=1))['status'],'ready')
+            self.assertEqual(request.call_args.args[1],'gemini-2.5-flash')
+        with app.connect() as db:
+            self.assertEqual(gemini.read_setting(db,'gemini_budget_2026-10-22'),3)
+            self.assertEqual(gemini.read_setting(db,'gemini_budget_2026-10-23'),1)
+
+    def test_fallback_cannot_exceed_app_budget(self):
+        with app.connect() as db:gemini.write_setting(db,'gemini_budget_2026-10-22',3)
+        quota=gemini.GeminiError('일일 모델 한도',{'code':'daily_model_quota'})
+        with patch.dict(os.environ,{'GEMINI_MODEL':'gemini-2.5-flash'}),patch('gemini.sources_for',return_value=[source()]),patch('gemini.generate',side_effect=quota) as request:
+            self.assertEqual(gemini.refresh(app.connect,CURRENT)['status'],'daily_limit')
+            self.assertEqual(request.call_count,1)
+        with app.connect() as db:self.assertEqual(gemini.read_setting(db,'gemini_budget_2026-10-22'),4)
+
+    def test_non_daily_errors_do_not_fallback_and_exhausted_lite_is_not_retried(self):
+        for code in ['http_429','http_403','invalid_json','finish_MAX_TOKENS']:
+            with self.subTest(code=code),patch('gemini.sources_for',return_value=[source()]),patch('gemini.generate',side_effect=gemini.GeminiError('失敗',{'code':code})) as request:
+                with app.connect() as db:db.execute('DELETE FROM settings')
+                self.assertEqual(gemini.refresh(app.connect,CURRENT)['status'],'error')
+                self.assertEqual(request.call_count,1)
+        with app.connect() as db:db.execute('DELETE FROM settings')
+        quota=gemini.GeminiError('일일 모델 한도',{'code':'daily_model_quota'})
+        with patch.dict(os.environ,{'GEMINI_MODEL':'gemini-2.5-flash'}),patch('gemini.sources_for',return_value=[source()]),patch('gemini.generate',side_effect=quota) as request:
+            self.assertEqual(gemini.refresh(app.connect,CURRENT)['status'],'provider_daily_limit')
+            self.assertEqual(request.call_count,2)
+            self.assertEqual(gemini.refresh(app.connect,CURRENT+timedelta(minutes=20))['status'],'provider_daily_limit')
+            self.assertEqual(request.call_count,2)
+        with app.connect() as db:db.execute('DELETE FROM settings')
+        with patch.dict(os.environ,{'GEMINI_MODEL':gemini.FALLBACK_MODEL}),patch('gemini.sources_for',return_value=[source()]),patch('gemini.generate',side_effect=quota) as request:
+            gemini.refresh(app.connect,CURRENT)
+            self.assertEqual(request.call_count,1)
+
     def test_success_is_cached_across_restarts_and_snapshot_does_not_expose_key(self):
         sources=[source()]
         with patch('gemini.sources_for',return_value=sources),patch('gemini.generate',return_value=gemini.validate_output(output(sources),sources)) as generate:
