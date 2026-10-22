@@ -6,8 +6,9 @@ import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, localcontext
 
-VERSION = '2'
+VERSION = '3'
 DEFAULT_MODEL = 'gemini-3.5-flash-lite'
 FALLBACK_MODEL = 'gemini-2.5-flash-lite'
 KST = timezone(timedelta(hours=9))
@@ -21,6 +22,8 @@ PROMPT = '''당신은 삼성전자·SK하이닉스 공개 자료를 정리하는
 연예인·개인 투자담·선정적인 주가 제목은 핵심 이슈에서 제외하라.
 영어도 한국어로 설명하되 원문에 없는 원인·효과를 단정하지 마라.
 금액·수치·단위는 출처의 표기를 그대로 쓰고 환산·추정하지 마라. 목표주가 표를 수정하지 마라.
+가능하면 수치보다 변화와 확인할 사항을 정성적으로 설명하라. 메타데이터 날짜를 사건 발생일로 쓰지 마라.
+인용 번호는 source_ids에만 넣고 본문에는 S1, [S1], 목록 번호를 쓰지 마라.
 제목만 있는 자료는 제목에서 확인되는 내용만 요약하라. 부족한 정보는 '확인 필요'라고 써라.
 why_it_matters는 확인된 변화가 무엇을 뜻하는지 조심스럽게 설명하고, 불확실하면 확인 필요라고 써라.
 watch_next는 이미 일어난 사실이 아니라 앞으로 원문에서 확인할 항목임을 분명히 하라.
@@ -38,10 +41,11 @@ class GeminiError(Exception):
 
 
 class OutputError(ValueError):
-    def __init__(self, code, issues=None):
+    def __init__(self, code, issues=None, numeric_review=None):
         super().__init__(code)
         self.code = code
         self.issues = issues or []
+        self.numeric_review = numeric_review or []
 
 
 def config():
@@ -186,8 +190,62 @@ def schema(sources=None):
         'required':['headline','highlights','companies']}
 
 
-def numbers(text):
-    return {n.replace(',','') for n in re.findall(r'\d[\d,]*(?:\.\d+)?', text)}
+NUMBER = r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
+AMOUNT = rf'(?:(?:{NUMBER}\s*[조억만천]\s*)+(?:{NUMBER})?|{NUMBER}(?:\s*(?:trillion|billion|million|thousand)\b)?)'
+CURRENCY = r'US\$|KRW|USD|EUR|JPY|CNY|RMB|₩|\$|€|원|달러|유로|엔|위안'
+MONEY_CLAIM = re.compile(rf'(?<![A-Za-z\d.,])(?:(?P<prefix>{CURRENCY})\s*(?P<first>{AMOUNT})(?![A-Za-z\d]|,\d|\.\d)|(?P<last>{AMOUNT})\s*(?P<suffix>{CURRENCY}))',re.I)
+PERCENT_CLAIM = re.compile(rf'(?<![\d.,])({NUMBER})\s*(?:%|percent\b|퍼센트)',re.I)
+NUMBER_CLAIM = re.compile(rf'(?<![\d.,])({AMOUNT})(?!\d|,\d|\.\d)',re.I)
+
+
+def amount(value):
+    """Exact decimal arithmetic for explicit scale labels; never currency conversion."""
+    normalized=re.sub(r'\s|,','',value).lower()
+    with localcontext() as context:
+        context.prec=max(32,len(normalized)+16)
+        english=re.fullmatch(r'(\d+(?:\.\d+)?)(trillion|billion|million|thousand)',normalized)
+        if english:
+            return Decimal(english[1])*{'trillion':10**12,'billion':10**9,'million':10**6,'thousand':1000}[english[2]]
+        total,last,position=Decimal(0),10**30,0
+        for match in re.finditer(r'(\d+(?:\.\d+)?)([조억만천]?)',normalized):
+            unit={'조':10**12,'억':10**8,'만':10000,'천':1000,'':1}[match[2]]
+            if match.start()!=position or unit>=last:raise ValueError('invalid_quantity')
+            total+=Decimal(match[1])*unit;last=unit;position=match.end()
+        if position!=len(normalized) or not position:raise ValueError('invalid_quantity')
+        return total
+
+
+def numeric_claims(text):
+    claims=set()
+    def add(unit,value):
+        try:claims.add((unit,amount(value)))
+        except (ValueError,InvalidOperation):claims.add(('unparsed',Decimal(0)))
+    def money(match):
+        unit=(match['prefix'] or match['suffix']).upper()
+        currency={'US$':'USD','$':'USD','달러':'USD','₩':'KRW','원':'KRW','€':'EUR','유로':'EUR','엔':'JPY','RMB':'CNY','위안':'CNY'}.get(unit,unit)
+        add(currency,match['first'] or match['last'])
+        return ' '
+    text=MONEY_CLAIM.sub(money,text)
+    def percent(match):
+        add('percent',match[1]);return ' '
+    text=PERCENT_CLAIM.sub(percent,text)
+    def number(match):
+        add('number',match[1]);return ' '
+    remaining=NUMBER_CLAIM.sub(number,text)
+    if re.search(r'\d',remaining):claims.add(('unparsed',Decimal(0)))
+    return claims
+
+
+def strip_markers(text, allowed):
+    """Only cited, known S-IDs and explicit list prefixes are formatting."""
+    ids=set(re.findall(r'(?<![A-Za-z0-9])S\d+(?![A-Za-z0-9])',text))
+    if not ids<=allowed:raise OutputError('unrecognized_inline_source')
+    def marker(match):
+        inside=match[1]
+        return '' if re.fullmatch(r'\s*S\d+(?:[\s,;·、]+S\d+)*\s*',inside) else match[0]
+    text=re.sub(r'[\[【(]([^\]】)]+)[\]】)]',marker,text)
+    text=re.sub(r'(?<![A-Za-z0-9])S\d+(?![A-Za-z0-9])','',text)
+    return re.sub(r'(?m)^\s*\d{1,2}[.)]\s+','',text).strip()
 
 
 def validate_output(value, sources, partial=False):
@@ -195,6 +253,7 @@ def validate_output(value, sources, partial=False):
         raise OutputError('invalid_briefing')
     source_map = {s['id']:s for s in sources}
     warnings = []
+    numeric_review = []
     def clean_text(value, limit, korean=True):
         if not isinstance(value,str) or not value.strip():
             raise OutputError('missing_text')
@@ -203,22 +262,34 @@ def validate_output(value, sources, partial=False):
         if korean and not re.search('[가-힣]',value):
             raise OutputError('missing_korean_text')
         return value.strip()
-    def item(raw, company=False):
+    def item(raw, company=False, path='item'):
         if not isinstance(raw,dict):
             raise OutputError('invalid_item')
         ids = raw.get('source_ids')
         if not isinstance(ids,list) or not 1<=len(ids)<=3 or any(not isinstance(i,str) or i not in source_map for i in ids):
             raise OutputError('unrecognized_source')
         refs = [source_map[i] for i in dict.fromkeys(ids)]
-        result = {k:clean_text(raw.get(k),limit,k!='title') for k,limit in
+        result = {k:strip_markers(clean_text(raw.get(k),limit,k!='title'),set(ids)) for k,limit in
                   [('title',100),('summary',400),('why_it_matters',300),('watch_next',220)]}
-        if not numbers(' '.join(result.values())) <= numbers(' '.join(s['title']+' '+s['excerpt'] for s in refs)):
-            raise OutputError('unsupported_numeric_claim')
+        if any(not text for text in result.values()):raise OutputError('missing_text')
         if company:
             key = raw.get('company')
             if key not in COMPANIES or any(key not in s['companies'] for s in refs):
                 raise OutputError('wrong_company_source')
             result['company'] = key
+        supported={claim for claim in numeric_claims(' '.join(s['title']+' '+s['excerpt'] for s in refs)) if claim[0]!='unparsed'}
+        rejected=[]
+        for field in ['title','summary','why_it_matters','watch_next']:
+            unmatched=numeric_claims(result[field])-supported
+            if unmatched:
+                if not partial:raise OutputError('unsupported_numeric_claim')
+                rejected.append(field)
+                warnings.append(path+':'+field+':unsupported_numeric_claim')
+                numeric_review.append(dict(path=path+':'+field,source_ids=list(dict.fromkeys(ids)),
+                    unmatched=sorted(unit+':'+format(value,'f')[:40] for unit,value in unmatched)[:8]))
+                result[field]='수치 확인 필요' if field=='title' else '관련 수치가 인용 자료에서 확인되지 않아 원문 확인이 필요합니다.'
+        if 'summary' in rejected and 'why_it_matters' in rejected:
+            raise OutputError('no_verified_explanation')
         result['sources'] = [dict(id=s['id'],title=s['title'],url=s['url'],source=s['source'],
                                   published=s['published'],basis=s['basis']) for s in refs]
         result['basis'] = 'title' if all(s['basis']=='title' for s in refs) else 'mixed'
@@ -227,8 +298,9 @@ def validate_output(value, sources, partial=False):
     if not isinstance(highlights,list) or not 1<=len(highlights)<=3 or not isinstance(companies,list) or len(companies)>2:
         raise OutputError('invalid_item_count')
     try:
-        headline = clean_text(value.get('headline'),180)
-        if not numbers(headline) <= numbers(' '.join(s['title']+' '+s['excerpt'] for s in sources)):
+        headline = strip_markers(clean_text(value.get('headline'),180),set(source_map))
+        supported={claim for claim in numeric_claims(' '.join(s['title']+' '+s['excerpt'] for s in sources)) if claim[0]!='unparsed'}
+        if not numeric_claims(headline) <= supported:
             raise OutputError('unsupported_headline_figure')
     except OutputError as error:
         if not partial:raise
@@ -238,7 +310,7 @@ def validate_output(value, sources, partial=False):
     for name, rows in [('highlights',highlights),('companies',companies)]:
         for index, row in enumerate(rows):
             try:
-                result[name].append(item(row,name=='companies'))
+                result[name].append(item(row,name=='companies',name+':'+str(index)))
             except OutputError as error:
                 if not partial:raise
                 warnings.append(name+':'+str(index)+':'+error.code)
@@ -247,7 +319,7 @@ def validate_output(value, sources, partial=False):
         raise OutputError('duplicate_company')
     expected = {company for s in sources for company in s['companies']}
     if not result['highlights'] and not result['companies']:
-        raise OutputError('no_verified_items',warnings)
+        raise OutputError('no_verified_items',warnings,numeric_review[:12])
     if set(company_keys) != expected:
         if not partial:raise OutputError('missing_company_briefing')
         for company in sorted(expected-set(company_keys)):
@@ -258,6 +330,8 @@ def validate_output(value, sources, partial=False):
                 watch_next='기업 관련 원문을 직접 확인하세요.',sources=[],basis='unverified'))
     if warnings:
         result['warnings'] = warnings
+    if numeric_review:
+        result['numeric_review']=numeric_review[:12]
     return result
 
 
@@ -285,7 +359,7 @@ def generate(key, model, sources):
         return validate_output(json.loads(text),sources,partial=True)
     except OutputError as error:
         raise GeminiError('출처·수치·구성을 확인할 수 있는 요약이 없어 기존 브리핑을 유지합니다.',
-                          {'code':error.code,'checks':error.issues[:8]}) from None
+                          {'code':error.code,'checks':error.issues[:8],'numeric_review':error.numeric_review}) from None
     except json.JSONDecodeError:
         raise GeminiError('Gemini가 올바른 JSON 형식으로 응답하지 않았습니다. 기존 브리핑을 유지합니다.',{'code':'invalid_json'}) from None
     except (KeyError, IndexError, ValueError, TypeError, AttributeError):

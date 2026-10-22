@@ -12,7 +12,7 @@ def main():
         safe={key:state.get(key) for key in ['configured','status','message','model','active_model',
               'fallback_model','diagnostic','attempts_today','daily_limit','retry_at']}
         brief=state.get('briefing')
-        safe['briefing'] = {key:brief.get(key) for key in ['generated_at','model','source_count','warnings']} if brief else None
+        safe['briefing'] = {key:brief.get(key) for key in ['generated_at','model','source_count','warnings','numeric_review']} if brief else None
         print(json.dumps(safe,ensure_ascii=False,indent=2))
     except (urllib.error.URLError,TimeoutError,ValueError,KeyError):
         raise SystemExit('앱 상태를 읽지 못했습니다. sudo systemctl status memory-brief --no-pager 로 확인하세요.') from None

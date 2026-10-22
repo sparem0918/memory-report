@@ -148,12 +148,70 @@ class GeminiTests(unittest.TestCase):
         raw['highlights'].append(invalid)
         raw['companies'][1]['source_ids']=['S1']
         result=gemini.validate_output(raw,sources,partial=True)
-        self.assertEqual(len(result['highlights']),1)
+        self.assertEqual(len(result['highlights']),2)
         self.assertEqual(result['highlights'][0]['title'],'HBM · DRAM')
         missing=next(c for c in result['companies'] if c['company']=='sk')
         self.assertEqual(missing['title'],'확인 필요');self.assertEqual(missing['sources'],[])
-        self.assertNotIn('999',json.dumps(result))
-        self.assertIn('highlights:1:unsupported_numeric_claim',result['warnings'])
+        self.assertNotIn('999',result['highlights'][1]['summary'])
+        self.assertIn('확인',result['highlights'][1]['summary'])
+        self.assertIn('highlights:1:summary:unsupported_numeric_claim',result['warnings'])
+
+    def test_cited_inline_ids_and_list_numbers_do_not_become_numeric_claims(self):
+        sources=[source()];raw=output(sources)
+        for item in raw['highlights']+raw['companies']:
+            item['summary']='1. '+item['summary']+' [S1]'
+            item['why_it_matters']+=' (S1)'
+        result=gemini.validate_output(raw,sources)
+        self.assertNotIn('[S1]',result['highlights'][0]['summary'])
+        self.assertFalse(result['highlights'][0]['summary'].startswith('1.'))
+        raw['highlights'][0]['summary']+=' [S999]'
+        with self.assertRaises(gemini.OutputError) as error:gemini.validate_output(raw,sources)
+        self.assertEqual(error.exception.code,'unrecognized_inline_source')
+
+    def test_exact_quantity_notation_normalizes_without_currency_conversion(self):
+        for original,translated in [
+            ('목표주가 125,000원','목표주가 12만5천원'),
+            ('목표주가 KRW 125000','목표주가 12.5만원'),
+            ('투자 금액 USD 0.5 billion','투자 금액 5억달러'),
+            ('투자 금액 $100.','투자 금액 100달러'),
+            ('투자 금액 25조원','투자 금액 25000000000000원'),
+            ('비율 20 percent','비율 20%'),
+            ('생산 200 layers','생산 200단')]:
+            with self.subTest(original=original,translated=translated):
+                self.assertEqual(gemini.numeric_claims(original),gemini.numeric_claims(translated))
+
+    def test_changed_currency_magnitude_and_percent_are_rejected(self):
+        for original,claim in [('목표주가 100원','목표주가 100만원'),
+                               ('투자 금액 USD 100','투자 금액 100원'),
+                               ('비율 20%','투자 금액 20원'),
+                               ('HBM4 메모리 공급','목표주가 4원')]:
+            sources=[source(title='삼성전자 '+original)];raw=output(sources)
+            raw['highlights'][0]['summary']='삼성전자의 '+claim+'입니다.'
+            with self.subTest(original=original),self.assertRaises(gemini.OutputError):gemini.validate_output(raw,sources)
+
+    def test_unverified_numeric_field_is_replaced_and_diagnosed_without_discarding_safe_explanation(self):
+        sources=[source()];raw=output(sources)
+        for item in raw['highlights']+raw['companies']:item['summary']='삼성전자 목표주가가 999만원입니다.'
+        result=gemini.validate_output(raw,sources,partial=True)
+        self.assertEqual(len(result['highlights']),1)
+        self.assertIn('원문 확인',result['highlights'][0]['summary'])
+        self.assertEqual(result['highlights'][0]['why_it_matters'],raw['highlights'][0]['why_it_matters'])
+        self.assertIn('KRW:9990000',result['numeric_review'][0]['unmatched'])
+        self.assertEqual(result['numeric_review'][0]['source_ids'],['S1'])
+
+    def test_no_substantive_verified_explanation_still_fails_with_numeric_diagnostic(self):
+        sources=[source()];raw=output(sources)
+        for item in raw['highlights']+raw['companies']:
+            item['summary']='목표주가는 999만원입니다.'
+            item['why_it_matters']='목표주가는 999만원입니다.'
+        with self.assertRaises(gemini.OutputError) as caught:gemini.validate_output(raw,sources,partial=True)
+        self.assertEqual(caught.exception.code,'no_verified_items')
+        self.assertIn('KRW:9990000',caught.exception.numeric_review[0]['unmatched'])
+
+    def test_publication_year_is_not_evidence_of_a_monetary_amount(self):
+        sources=[source()];raw=output(sources)
+        raw['highlights'][0]['summary']='목표주가는 2026원입니다.'
+        with self.assertRaises(gemini.OutputError):gemini.validate_output(raw,sources)
 
     def test_finish_reason_and_failed_checks_are_diagnosable_without_raw_response(self):
         sources=[source()]
