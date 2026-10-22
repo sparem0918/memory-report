@@ -41,15 +41,30 @@ fi
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
 
-echo 'Choose the website password. It stays on this server; do not send it in chat.'
-read -r -s -p 'Password (at least 12 characters): ' web_password </dev/tty
-echo
-read -r -s -p 'Repeat password: ' password_repeat </dev/tty
-echo
-if [[ ${#web_password} -lt 12 || "$web_password" != "$password_repeat" ]]; then
-    echo 'Passwords must match and have at least 12 characters. No website config was changed.' >&2
-    exit 1
-fi
+choose_web_password() {
+    echo 'Choose the website password. It stays on this server; do not send it in chat.'
+    echo 'Input is hidden. Press Enter after each entry. Ctrl+C cancels.'
+    while true; do
+        read -r -s -p 'Password (at least 12 characters): ' web_password </dev/tty
+        echo
+        read -r -s -p 'Repeat password: ' password_repeat </dev/tty
+        echo
+        if [[ ${#web_password} -lt 12 ]]; then
+            echo 'Too short: use at least 12 characters. Please try again.' >&2
+            unset web_password password_repeat
+            continue
+        fi
+        if [[ "$web_password" != "$password_repeat" ]]; then
+            echo 'The two entries do not match. Type the SAME password twice. Please try again.' >&2
+            unset web_password password_repeat
+            continue
+        fi
+        echo 'Password entries accepted.'
+        break
+    done
+}
+
+choose_web_password
 password_hash=$(printf '%s\n' "$web_password" | caddy hash-password)
 unset web_password password_repeat
 
