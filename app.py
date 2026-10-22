@@ -16,6 +16,8 @@ from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import reports
+
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('MEMORY_DB', str(ROOT / '.data' / 'memory.db')))
 KST = timezone(timedelta(hours=9))
@@ -59,6 +61,11 @@ def init_db():
             id INTEGER PRIMARY KEY, started TEXT NOT NULL, completed TEXT NOT NULL,
             added INTEGER NOT NULL, successful INTEGER NOT NULL, errors TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS report_inputs (
+            article_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS auto_targets (
+            article_id TEXT PRIMARY KEY, data TEXT NOT NULL,
+            dismissed INTEGER NOT NULL DEFAULT 0);
         ''')
 
 
@@ -100,7 +107,8 @@ def parse_feed(payload, company, region):
         key = hashlib.sha256((company + source + re.sub(r'\W', '', title).lower()).encode()).hexdigest()
         result.append(dict(id=key, title=title, url=url, source=source, published=published,
                            collected=now(), company=company, region=region, topic=topic,
-                           report=int(topic == '증권가 리포트')))
+                           report=int(topic == '증권가 리포트'),
+                           summary=reports.rss_summary(item.findtext('description') or '')))
     return result
 
 
@@ -126,21 +134,105 @@ def collect():
             for spec, future in futures:
                 try:
                     articles = future.result()
-                    with connect() as db:
-                        before = db.total_changes
-                        for article in articles:
-                            db.execute('INSERT OR IGNORE INTO articles VALUES (:id,:title,:url,:source,:published,:collected,:company,:region,:topic,:report)', article)
-                        added += db.total_changes - before
+                    added += store_articles(articles)
                     successful += 1
                 except Exception as exc:
                     # Do not persist proxy URLs, headers, or other potentially sensitive error details.
                     errors.append(f'{COMPANIES[spec[0]]} · {spec[1]}: {type(exc).__name__} — 수집 주소 접근 또는 RSS 응답을 확인하세요.')
+        try:
+            target_result = collect_targets()
+        except Exception:
+            target_result = {'updated': now(), 'errors': ['목표주가 자동 정리 중 오류가 발생했습니다. 기존 기록은 유지됩니다.']}
         with connect() as db:
             db.execute('INSERT INTO runs(started,completed,added,successful,errors) VALUES (?,?,?,?,?)',
                        (started, now(), added, successful, json.dumps(errors, ensure_ascii=False)))
-        return dict(added=added, successful=successful, total=len(FEEDS), errors=errors)
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('report_collection',?)",
+                       (json.dumps(target_result, ensure_ascii=False),))
+        return dict(added=added, successful=successful, total=len(FEEDS), errors=errors,
+                    target_collection=target_result)
     finally:
         LOCK.release()
+
+
+def store_articles(articles):
+    added = 0
+    with connect() as db:
+        for article in articles:
+            cursor = db.execute('INSERT OR IGNORE INTO articles VALUES (:id,:title,:url,:source,:published,:collected,:company,:region,:topic,:report)', article)
+            added += cursor.rowcount
+            if not cursor.rowcount:
+                db.execute('UPDATE articles SET title=?,url=?,published=?,collected=? WHERE id=?',
+                           (article['title'],article['url'],article['published'],article['collected'],article['id']))
+            detail = article.get('detail') or {'summary': article.get('summary', '')}
+            db.execute('INSERT OR REPLACE INTO report_inputs VALUES (?,?)',
+                       (article['id'], json.dumps(detail, ensure_ascii=False)))
+    return added
+
+
+def save_auto_target(record):
+    with connect() as db:
+        # Dismissed automatic records stay dismissed on every subsequent collection.
+        db.execute('''INSERT INTO auto_targets(article_id,data) VALUES (?,?)
+            ON CONFLICT(article_id) DO UPDATE SET data=excluded.data''',
+                   (record['article_id'], json.dumps(record, ensure_ascii=False)))
+
+
+def target_candidates():
+    cutoff = (datetime.now(KST)-timedelta(days=14)).date().isoformat()
+    with connect() as db:
+        rows = db.execute('''SELECT a.*, i.data AS detail FROM articles a
+            LEFT JOIN report_inputs i ON a.id=i.article_id WHERE a.published>=?
+            ORDER BY a.report DESC,a.published DESC LIMIT 600''', (cutoff,)).fetchall()
+    return [(dict(row), json.loads(row['detail']) if row['detail'] else {}) for row in rows]
+
+
+def backfill_targets():
+    """Immediate, offline-only backfill after upgrade; never changes manual rows."""
+    with connect() as db:
+        existing = {row[0] for row in db.execute('SELECT article_id FROM auto_targets')}
+    for article, detail in target_candidates():
+        if article['id'] not in existing and (reports.is_candidate(article) or detail.get('trusted_report')):
+            save_auto_target(reports.extract_record(article, detail))
+
+
+def collect_targets():
+    raw_sources, errors = reports.public_sources()
+    articles = []
+    for source in raw_sources:
+        # Report titles can be identical across brokers/dates. Bind to the actual source URL.
+        key = hashlib.sha256((source['company']+'\n'+source['source']+'\n'+source['url']).encode()).hexdigest()
+        articles.append(dict(source, id=key, region='국내', topic='증권가 리포트', report=1, collected=now()))
+    store_articles(articles)
+    fresh_public_ids = {a['id'] for a in articles}
+    processed, body_reads = 0, 0
+    # Always process the current report listings before other RSS candidates.
+    candidates = target_candidates()
+    candidates.sort(key=lambda pair: not pair[1].get('trusted_report', False))
+    for article, detail in candidates:
+        if not (reports.is_candidate(article) or detail.get('trusted_report')):
+            continue
+        needs_body = detail.get('trusted_report') or urllib.parse.urlsplit(article['url']).hostname == 'www.hankyung.com'
+        if needs_body and article['id'] not in fresh_public_ids:
+            # Archived reports retain their evidence; bounded fresh listings are refreshed.
+            with connect() as db:
+                if db.execute('SELECT 1 FROM auto_targets WHERE article_id=?', (article['id'],)).fetchone():
+                    continue
+            save_auto_target(reports.extract_record(article, detail))
+            processed += 1
+            continue
+        if needs_body and body_reads >= 18:
+            with connect() as db:
+                if db.execute('SELECT 1 FROM auto_targets WHERE article_id=?', (article['id'],)).fetchone():
+                    continue
+            record = reports.extract_record(article, detail, notes=['본문 확인은 다음 수집에서 재시도합니다.'])
+        else:
+            if needs_body:
+                body_reads += 1
+            record = reports.enrich(article, detail)
+        save_auto_target(record)
+        processed += 1
+    return dict(updated=now(), processed=processed, public_items=len(articles),
+                pdf_reader=bool(reports.shutil.which('pdftotext')), errors=errors)
 
 
 def next_run(current=None):
@@ -161,9 +253,11 @@ def scheduler():
         slot = slot_day.strftime('%Y-%m-%d') + f'-{max(hours) if hours else 18:02d}'
         with connect() as db:
             previous = db.execute("SELECT value FROM settings WHERE key='last_slot'").fetchone()
-            if previous is None or previous['value'] != slot:
+            report_version = db.execute("SELECT value FROM settings WHERE key='report_version'").fetchone()
+            if previous is None or previous['value'] != slot or report_version is None or report_version['value'] != reports.VERSION:
                 if not LOCK.locked():
                     db.execute("INSERT OR REPLACE INTO settings VALUES ('last_slot',?)", (slot,))
+                    db.execute("INSERT OR REPLACE INTO settings VALUES ('report_version',?)", (reports.VERSION,))
                     should_run = True
                 else:
                     should_run = False
@@ -177,13 +271,19 @@ def scheduler():
 def snapshot():
     with connect() as db:
         articles = [dict(r) for r in db.execute('SELECT * FROM articles ORDER BY published DESC LIMIT 600')]
-        targets = [dict(r) for r in db.execute('SELECT * FROM targets ORDER BY published DESC,id DESC LIMIT 200')]
+        manual = [dict(r, origin='manual', status='manual', missing_fields=[], date_kind='report')
+                  for r in db.execute('SELECT * FROM targets ORDER BY published DESC,id DESC LIMIT 200')]
+        automatic = [json.loads(r['data']) for r in db.execute('SELECT data FROM auto_targets WHERE dismissed=0')]
+        automatic = sorted(automatic, key=lambda row: (row['published'],str(row['id'])), reverse=True)[:200]
+        targets = sorted(manual + automatic, key=lambda row: (row['published'],str(row['id'])), reverse=True)
+        report_run = db.execute("SELECT value FROM settings WHERE key='report_collection'").fetchone()
         last = db.execute('SELECT * FROM runs ORDER BY id DESC LIMIT 1').fetchone()
         last_ok = db.execute('SELECT completed FROM runs WHERE successful>0 ORDER BY id DESC LIMIT 1').fetchone()
     run = dict(last) if last else None
     if run:
         run['errors'] = json.loads(run['errors'])
     return dict(articles=articles, targets=targets, last_run=run,
+                target_collection=json.loads(report_run['value']) if report_run else None,
                 last_success=last_ok['completed'] if last_ok else None,
                 next_run=next_run().isoformat(), collecting=LOCK.locked(), schedule=['08:00', '18:00'], timezone='Asia/Seoul')
 
@@ -234,7 +334,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         if path == '/api/dashboard':
-            return self.respond(snapshot())
+            result = snapshot()
+            # Old, still-open browser tabs assume every price is non-null. Keep their
+            # original manual-only response until they load the updated frontend.
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if query.get('target_format') != ['2']:
+                result['targets'] = [row for row in result['targets'] if row['origin'] != 'auto']
+            return self.respond(result)
         if path == '/api/health':
             with connect() as db:
                 db.execute('SELECT 1').fetchone()
@@ -250,6 +356,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(len(payload)))
         self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Cache-Control', 'no-cache')
         self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(payload)
@@ -284,6 +391,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self.valid_origin():
             return self.respond({'error': '동일한 사이트에서 요청하세요.'}, 403)
+        auto = re.fullmatch(r'/api/targets/auto-([a-f0-9]{64})', self.path)
+        if auto:
+            with connect() as db:
+                cursor = db.execute('UPDATE auto_targets SET dismissed=1 WHERE article_id=? AND dismissed=0', (auto[1],))
+            return self.respond({'deleted': cursor.rowcount == 1})
         match = re.fullmatch(r'/api/targets/(\d+)', self.path)
         if not match:
             return self.respond({'error': '찾을 수 없습니다.'}, 404)
@@ -300,6 +412,7 @@ def main():
     parser.add_argument('--no-scheduler', action='store_true')
     args = parser.parse_args()
     init_db()
+    backfill_targets()
     if args.collect:
         result = collect()
         print(json.dumps(result, ensure_ascii=False))

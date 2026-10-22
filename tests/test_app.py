@@ -24,6 +24,9 @@ class AppTests(unittest.TestCase):
         self.original_db = app.DB
         app.DB = Path(self.temp.name) / 'test.db'
         app.init_db()
+        public = patch('reports.public_sources', return_value=([], []))
+        public.start()
+        self.addCleanup(public.stop)
 
     def tearDown(self):
         app.DB = self.original_db
@@ -92,6 +95,17 @@ class AppTests(unittest.TestCase):
             self.assertEqual(len(request('/api/dashboard')[1]['targets']),1)
             self.assertEqual(request('/api/targets/'+str(created['id']),method='DELETE')[1],{'deleted':True})
             self.assertEqual(request('/api/dashboard')[1]['targets'],[])
+            source=dict(id='a'*64,company='samsung',title='KB증권 삼성전자 목표주가 10만원 제시',
+                        url='https://news.google.com/rss/articles/test',source='Test',
+                        published=app.now(),collected=app.now(),region='국내',topic='증권가 리포트',report=1)
+            app.store_articles([source]);app.backfill_targets()
+            self.assertEqual(request('/api/dashboard')[1]['targets'],[])  # legacy clients never see nullable automatic prices
+            automatic=request('/api/dashboard?target_format=2')[1]['targets'][0]
+            self.assertEqual(automatic['origin'],'auto')
+            self.assertIsNone(automatic['previous'])
+            self.assertEqual(request('/api/targets/'+automatic['id'],method='DELETE')[1],{'deleted':True})
+            app.collect_targets()
+            self.assertEqual(request('/api/dashboard?target_format=2')[1]['targets'],[])
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 request('/api/targets',self.target(),headers={'Origin':'https://different.example'})
             self.assertEqual(caught.exception.code,403)
