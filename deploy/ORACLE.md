@@ -76,3 +76,30 @@ sudo systemctl restart memory-brief
 코드를 수정한 새 압축 파일을 전달한 뒤 같은 설치 절차를 반복합니다. 설치기는 기존 DB를 유지하며 새 릴리스로 전환합니다. 시작 확인에 실패하면 이전 코드로 되돌립니다. 앱 코드가 기존 데이터 구조를 바꾸는 업데이트라면 먼저 별도의 마이그레이션 검토가 필요합니다. 백업과 이전 릴리스는 자동 삭제하지 않습니다.
 
 서버와 저장 공간이 본인의 오라클 무료 할당 범위에 포함되는지는 오라클 콘솔에서 확인하세요. 이 설치 절차는 새 VM이나 유료 클라우드 리소스를 생성하지 않습니다.
+
+## 개인 웹사이트로 HTTPS 공개
+
+전용 `memory-brief` VM의 앱 설치와 수집을 확인한 다음 진행합니다. 기존 `screener` VM이나 `screener-vcn`은 변경하지 않습니다.
+
+1. 도메인이 있으면 새 서버의 공인 IPv4로 A 레코드를 설정합니다. 도메인을 구매하지 않을 때는 `memory-brief.PUBLIC-IP-WITH-DASHES.sslip.io` 같은 외부 무료 DNS 주소를 사용할 수 있습니다. 예를 들어 `1.2.3.4`이면 `memory-brief.1-2-3-4.sslip.io`입니다. 이 방식은 sslip.io의 가용성과 현재 공인 IP에 의존합니다. 서버에서 DNS 조회가 실제 IP로 되는지 확인해야 합니다.
+2. OCI 콘솔의 **새 `memory-brief-vcn`에 연결된 공용 서브넷의 Security List**에서 상태 저장 Ingress 규칙 두 개를 추가합니다. Source CIDR은 `0.0.0.0/0`, IP Protocol은 TCP, Source Port는 비워두고 Destination Port를 각각 `80`, `443`으로 지정합니다. 기존 SSH 규칙은 유지하고 8000번은 공개하지 않습니다. NAT 게이트웨이, 로드 밸런서, 유료 DNS 영역을 만들 필요는 없습니다.
+3. 새 Ubuntu 서버에서 아래를 실행합니다. `YOUR_HOSTNAME`은 실제 주소로 바꾸고 `https://`는 붙이지 않습니다.
+
+```bash
+cd ~/memory-report
+git pull --ff-only
+sudo bash deploy/publish.sh YOUR_HOSTNAME
+```
+
+스크립트는 Ubuntu 패키지 저장소의 Caddy를 설치하고 로그인 암호를 터미널에서 두 번 묻습니다. 암호를 입력할 때 글자가 표시되지 않는 것이 정상입니다. **암호를 채팅에 보내지 마세요.** 아이디는 `memory`입니다. 암호는 해시 형태로 서버 설정에 저장합니다. 공개 주소의 화면과 API 모두 HTTPS·비밀번호 인증으로 보호합니다.
+
+Caddy는 무료 ACME 인증서를 자동 신청하고 갱신합니다. HTTPS 발급에는 DNS 일치, 외부에서 도달 가능한 80/443 포트, 인증기관의 발급 제한 조건이 필요합니다. 소프트웨어 설치는 유료 OCI 리소스를 생성하지 않으며, 서버·저장 공간·트래픽은 기존 무료 할당 범위 내에서 운영해야 합니다. 무료 DNS 서비스와 인증서 발급 성공을 사전에 보장하지 않습니다.
+
+검증은 다른 기기의 브라우저로 HTTPS 주소를 열어 인증서 경고 없이 로그인 화면이 나오는지 확인한 다음, 로그인하여 실제 기사와 수집 결과를 확인합니다. 인증 없이 `/api/dashboard`를 열면 401이 나와야 합니다. 서비스 상태만으로 외부 접속 성공을 판단하지 않습니다. 인증서 발급이 안 되면 검증을 끄지 말고 DNS·포트·Caddy 로그를 확인하세요.
+
+```bash
+sudo systemctl status caddy --no-pager
+sudo journalctl -u caddy -n 50 --no-pager
+```
+
+`publish.sh`는 기존 사용자 지정 Caddy 설정이 있으면 중단합니다. 기본 또는 이전 Memory Brief 설정은 백업 후 업데이트합니다. Ubuntu의 기존 방화벽 규칙을 유지하면서 TCP 80/443만 추가하며 UFW 또는 iptables-persistent로 유지합니다. 운영 중인 VM에서 방화벽 관리 도구를 변경했다면 먼저 해당 정책을 검토하세요. 앱 자체는 계속 127.0.0.1:8000에서 실행되며 디자인 업데이트는 기존 `install.sh` 절차로 적용합니다.
