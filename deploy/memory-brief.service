@@ -1,0 +1,28 @@
+# Managed by Memory Brief deploy/install.sh
+[Unit]
+Description=Memory Brief semiconductor dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=memory-brief
+Group=memory-brief
+WorkingDirectory=/opt/memory-brief/current
+ExecStart=@PYTHON@ /opt/memory-brief/current/app.py --host 127.0.0.1 --port 8000
+Environment=MEMORY_DB=/var/lib/memory-brief/memory.db
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=memory-brief
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/memory-brief
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f8"><title>메모리 브리프 — 반도체를 읽는 가장 명확한 방법</title>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="메모리 브리프 홈"><span class="brand-mark">m<span>·</span></span><span>memory<span class="brand-light">brief</span><small>SEMICONDUCTOR INTELLIGENCE</small></span></a>
+    <div class="side-caption">WORKSPACE</div>
+    <nav aria-label="주 메뉴">
+      <button class="nav-item active" data-view="overview"><span class="nav-icon">▦</span>오늘의 브리핑<span class="nav-dot"></span></button>
+      <button class="nav-item" data-view="news"><span class="nav-icon">▤</span>전체 뉴스<span id="nav-count" class="nav-count">0</span></button>
+      <button class="nav-item" data-view="reports"><span class="nav-icon">↗</span>증권가 리포트</button>
+      <button class="nav-item" data-view="saved"><span class="nav-icon">♧</span>저장한 기사</button>
+    </nav>
+    <div class="side-caption company-caption">WATCHLIST <span>02</span></div>
+    <button class="watch-item" data-company="samsung"><span class="company-avatar samsung">S</span><span>삼성전자<small>005930 · KOSPI</small></span><span class="watch-arrow">↗</span></button>
+    <button class="watch-item" data-company="sk"><span class="company-avatar sk">SK</span><span>SK하이닉스<small>000660 · KOSPI</small></span><span class="watch-arrow">↗</span></button>
+    <div class="side-bottom"><div class="schedule-icon">◷</div><strong>하루 두 번, 중요한 변화만</strong><p>오전 8시 · 오후 6시<br>한국 시간 기준</p><div class="schedule-pill"><span></span>서버 실행 중 정기 수집</div></div>
+    <div class="side-footer"><span class="avatar">나</span><div>나의 반도체 리서치<small>Personal workspace</small></div></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><span>내 워크스페이스 <span class="breadcrumb">/</span> <strong id="breadcrumb">오늘의 브리핑</strong></span><div class="topbar-right"><span class="timezone">KST <span>UTC+9</span></span><span class="top-avatar">나</span></div></header>
+    <main>
+      <div class="page-heading"><div><div class="eyebrow"><span></span> YOUR DAILY SEMICONDUCTOR BRIEF</div><h1 id="page-title">반도체의 흐름을, 한눈에<span>.</span></h1><p>삼성전자와 SK하이닉스. 흩어진 소식에서 중요한 변화를 읽으세요.</p></div><div class="heading-actions"><div id="today" class="date"></div><button id="refresh" class="button primary"><span>⟳</span> 지금 수집하기</button></div></div>
+      <div class="edition-bar"><div><span class="edition-label">DAILY BRIEF</span><span id="edition-date"></span><span class="edition-divider">/</span><span id="updated">아직 수집된 데이터가 없습니다</span></div><span id="next-run"></span></div>
+      <div id="notice" class="notice" role="status"></div>
+      <div id="demo-banner" class="demo-banner" hidden><span><strong>예시 화면</strong> 아래 기사·목표주가는 화면 설명용 가상 데이터입니다. 실제 투자 정보가 아닙니다.</span><button id="exit-demo">실제 데이터로 돌아가기 ↗</button></div>
+
+      <section id="overview-section">
+        <div class="section-heading"><h2><span class="spark">✧</span> 오늘의 핵심 브리핑</h2><span class="section-note">최근 72시간 · 제목 기반 핵심 기사</span></div>
+        <div id="highlights" class="highlights"></div>
+        <div class="company-grid" id="company-cards"></div>
+      </section>
+
+      <section class="reports-section" id="targets-section">
+        <div class="section-heading"><div class="heading-with-count"><h2>목표주가 체크</h2><span class="label">원문 확인 기록</span></div><button id="add-target" class="text-button">+ 리포트 기록하기</button></div>
+        <div class="target-table-wrap"><table><thead><tr><th>기업 / 증권사</th><th>발표일</th><th>이전 목표가</th><th>변경 목표가</th><th>변동률</th><th>투자의견</th><th>출처</th><th><span class="sr-only">삭제</span></th></tr></thead><tbody id="targets"></tbody></table><div id="targets-empty" class="table-empty"></div></div>
+        <p class="footnote">목표주가는 증권사의 전망입니다. 금액을 자동 추정하지 않으며, 원문을 확인한 기록만 표시합니다.</p>
+      </section>
+
+      <section class="news-section">
+        <div class="section-heading"><div class="heading-with-count"><h2 id="news-title">뉴스 & 인사이트</h2><span id="article-count" class="count-badge">0</span></div><div class="source-note"><span></span>국내 · 해외 공개 뉴스</div></div>
+        <div class="news-toolbar"><div class="tabs" role="group" aria-label="기업 선택"><button class="tab active" data-filter="all">전체</button><button class="tab" data-filter="samsung">삼성전자</button><button class="tab" data-filter="sk">SK하이닉스</button></div><label class="search"><span>⌕</span><input id="search" type="search" placeholder="기사 제목, 언론사 검색" aria-label="기사 검색"><kbd>/</kbd></label></div>
+        <div class="filter-row"><div id="topic-filters"><button class="chip active" data-topic="all">모든 주제</button><button class="chip" data-topic="HBM · AI">HBM · AI</button><button class="chip" data-topic="DRAM · 메모리">DRAM</button><button class="chip" data-topic="NAND">NAND</button><button class="chip" data-topic="증권가 리포트">증권가 리포트</button></div><select id="region" aria-label="뉴스 지역"><option value="all">국내 + 해외</option>국내</option><option>해외</option></select></div>
+        <div id="news-list" class="news-list"></div><button id="load-more" class="load-more" hidden>기사 더 보기 ↓</button>
+      </section>
+      <footer class="footer"><a class="footer-brand" href="/">memorybrief<span>반도체를 읽는 가장 명확한 방법</span></a><p>공개 RSS 제목 기반 정보 모음 · 투자 권유가 아닙니다.<br>기사 원문과 리포트의 작성일·내용을 함께 확인하세요.</p></footer>
+    </main>
+  </div>
+  <dialog id="target-dialog"><form id="target-form"><div class="dialog-header"><div><span class="eyebrow">RESEARCH NOTE</span><h2>목표주가 기록하기</h2></div><button type="button" id="close-dialog" class="icon-button" aria-label="닫기">×</button></div><p class="dialog-description">직접 확인한 리포트의 내용을 입력하세요. 출처와 함께 보관합니다.</p><div class="form-grid"><label>기업<select name="company" required><option value="samsung">삼성전자</option><option value="sk">SK하이닉스</option></select></label><label>증권사<input name="broker" maxlength="80" required placeholder="증권사 이름"></label><label>이전 목표주가 (원)<input name="previous" type="number" min="1" max="10000000" step="1" required></label><label>변경 목표주가 (원)<input name="target" type="number" min="1" max="10000000" step="1" required></label><label>발표일<input name="published" type="date" required></label><label>투자의견<select name="opinion"><option>매수</option><option>중립</option><option>매도</option><option>의견 없음</option></select></label><label class="full">원문 링크<input name="url" type="url" required placeholder="https://…" maxlength="2000"></label><label class="full">변경 사유<textarea name="reason" required maxlength="1000" rows="3" placeholder="리포트에서 확인한 근거를 요약해 주세요."></textarea></label></div><p id="form-error" class="form-error" role="alert"></p><button class="button primary form-submit" type="submit">기록 저장하기</button></form></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body></html>

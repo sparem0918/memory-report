@@ -1,0 +1,154 @@
+'use strict';
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
+const companies = {samsung: '삼성전자', sk: 'SK하이닉스'};
+let data = {articles: [], targets: []}, view = 'overview', company = 'all', topic = 'all', demo = false, limit = 15;
+let saved = new Set();
+try { saved = new Set(JSON.parse(localStorage.getItem('memory-saved') || '[]')); } catch (_) {}
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+const safeURL = (value) => { try { const u = new URL(value); return u.protocol === 'https:' ? esc(u.href) : '#'; } catch (_) { return '#'; } };
+const money = (n) => new Intl.NumberFormat('ko-KR').format(n) + '원';
+const dateText = (value, options = {}) => new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul', month:'2-digit', day:'2-digit', ...options}).format(new Date(value));
+const link = (url, text, cls = '') => `<a href="${safeURL(url)}" target="_blank" rel="noopener noreferrer" class="${cls}">${text}</a>`;
+let toastTimer;
+function toast(text) { $('#toast').textContent = text; $('#toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').hidden = true, 3500); }
+function demoData() {
+  const stamp = new Date().toISOString();
+  const entries = [
+    ['sk','국내','HBM · AI','[예시] HBM 수요 확대, 고부가 메모리 공급 전략에 주목','예시 경제신문'],
+    ['samsung','해외','DRAM · 메모리','[Sample] Memory demand in focus as AI infrastructure expands','Sample International News'],
+    ['samsung','국내','증권가 리포트','[예시] 증권가, 메모리 업황 회복 속도와 수익성 개선에 주목','예시 증권뉴스'],
+    ['sk','해외','HBM · AI','[Sample] High-bandwidth memory remains a focus for AI investment','Sample Global News'],
+    ['samsung','국내','NAND','[예시] NAND 수요와 재고 정상화, 하반기 관전 포인트','예시 산업뉴스'],
+    ['sk','국내','증권가 리포트','[예시] 리포트 읽기: 실적 추정과 목표주가 변경 근거 확인하기','예시 리서치'],
+  ];
+  return {articles: entries.map(([company,region,topic,title,source],i) => ({id:'demo-'+i,company,region,topic,title,source,published:stamp,url:'#',report:Number(topic==='증권가 리포트')})),
+    targets:[{id:'demo',company:'sk',broker:'예시 증권사 A',previous:200000,target:240000,opinion:'매수 (가상)',reason:'예시: HBM 수요 증가에 따른 이익 추정치 상향. 실제 리포트가 아닌 설명용 기록입니다.',url:'#',published: new Date().toLocaleDateString('sv-SE',{timeZone:'Asia/Seoul'})}]};
+}
+function current() { return demo ? demoData() : data; }
+function renderStatus() {
+  const stamp = new Date();
+  $('#today').textContent = dateText(stamp, {year:'numeric',month:'long',day:'numeric',weekday:'long'});
+  $('#edition-date').textContent = dateText(stamp, {year:'numeric'});
+  $('#updated').textContent = data.last_success ? `최근 수집 ${dateText(data.last_success,{hour:'2-digit',minute:'2-digit'})}` : '아직 수집된 데이터가 없습니다';
+  $('#next-run').textContent = data.next_run ? `다음 수집 ${dateText(data.next_run,{hour:'2-digit',minute:'2-digit'})} KST` : '매일 08:00 · 18:00 KST';
+  const btn = $('#refresh');
+  btn.disabled = !!data.collecting;
+  btn.innerHTML = data.collecting ? '<span>⟳</span> 수집 중…' : '<span>⟳</span> 지금 수집하기';
+  const failed = data.last_run && data.last_run.successful < 6;
+  const notice = $('#notice');
+  notice.classList.toggle('visible', !demo && (failed || !data.articles.length));
+  if (failed) {
+    notice.innerHTML = `<span><strong>${data.last_run.successful ? '일부 수집 지연' : '뉴스 수집 연결을 확인해 주세요'}</strong> · ${data.last_run.successful}/6개 피드 수집 완료. ${data.last_run.successful ? '기존 기사와 수집된 결과를 표시합니다.' : '환경 설정에서 news.google.com 접근을 허용한 뒤 다시 수집하세요.'}</span><button data-action="demo">예시 화면 살펴보기 ↗</button>`;
+  } else {
+    notice.innerHTML = '<span>첫 브리핑을 준비하고 있습니다. 지금 수집하거나, 예시 화면에서 구성을 먼저 살펴보세요.</span><button data-action="demo">예시 화면 살펴보기 ↗</button>';
+  }
+  $('#demo-banner').hidden = !demo;
+}
+function renderHighlights(articles) {
+  const cutoff = Date.now() - 72*3600*1000;
+  const recent = articles.filter(a => new Date(a.published).getTime() >= cutoff);
+  const selected = [], seen = new Set(), sources = new Set();
+  // Prefer a mix of topics and publishers rather than three copies of one story.
+  for (const a of recent) {
+    if (!seen.has(a.topic) && !sources.has(a.source)) { selected.push(a); seen.add(a.topic); sources.add(a.source); }
+    if (selected.length === 3) break;
+  }
+  for (const a of recent) { if (selected.length < 3 && !selected.some(b => b.id === a.id)) selected.push(a); }
+  const prompts = [
+    ['기업별 주요 변화', '삼성전자와 SK하이닉스의 새로운 소식을 모아 기업별로 정리합니다.'],
+    ['HBM부터 메모리 업황까지', 'HBM · DRAM · NAND 관련 기사를 주제별로 살펴볼 수 있습니다.'],
+    ['증권가의 시선', '목표주가와 투자의견 관련 기사를 모아 원문 확인을 돕습니다.'],
+  ];
+  $('#highlights').innerHTML = [0,1,2].map(i => {
+    const a = selected[i];
+    return `<article class="highlight"><div class="highlight-top"><span class="highlight-tag">${esc(a?.topic || '수집 대기')}</span><span class="highlight-number">0${i+1}</span></div><h3>${a ? (demo ? esc(a.title) : link(a.url,esc(a.title))) : prompts[i][0]}</h3>${!a ? `<p>${prompts[i][1]}</p>` : ''}<div class="highlight-bottom"><span>${a ? esc(a.source) : '첫 수집 후 기사가 표시됩니다'}</span>${a && !demo ? link(a.url,'원문 읽기 ↗') : '<span>↗</span>'}</div></article>`;
+  }).join('');
+  $('#company-cards').innerHTML = Object.entries(companies).map(([key,name]) => {
+    const items = recent.filter(a=>a.company === key);
+    const topics = [...new Set(items.map(a=>a.topic))].slice(0,3);
+    return `<article class="company-card"><div class="company-card-header"><span class="company-avatar ${key==='sk'?'sk':'samsung'}">${key==='sk'?'SK':'S'}</span><div><h3>${name}</h3><span class="stock-code">${key==='sk'?'000660':'005930'} · KOSPI</span></div><button class="company-more" data-company="${key}">소식 보기 ↗</button></div><div class="company-card-content"><div class="company-stat"><small>최근 72시간 수집 기사</small><strong>${items.length}<span>건</span></strong></div><div class="company-topics">${topics.length ? topics.map(t=>`<span class="topic-small">${esc(t)}</span>`).join('') : '<span class="company-no-data">새로운 소식이 모이면<br>주요 주제를 알려드려요.</span>'}</div></div></article>`;
+  }).join('');
+}
+function renderTargets(targets) {
+  const list = targets.filter(t => company === 'all' || t.company === company);
+  $('#targets-empty').hidden = !!list.length;
+  $('#targets-empty').innerHTML = '<strong>아직 기록된 목표주가가 없습니다.</strong>리포트를 확인한 뒤 목표주가와 변경 사유를 기록해 보세요.';
+  $('#targets').innerHTML = list.map(t => {
+    const change = (t.target/t.previous-1)*100;
+    return `<tr><td class="table-company">${companies[t.company]}<small>${esc(t.broker)}</small></td><td>${esc(t.published)}</td><td class="old-price">${money(t.previous)}</td><td class="new-price">${money(t.target)}</td><td><span class="change ${change<0?'down':change===0?'flat':''}">${change>0?'+':''}${change.toFixed(1)}%</span></td><td class="opinion">${esc(t.opinion)}</td><td>${demo ? '<span class="source-link">가상 예시</span>' : link(t.url,'원문 ↗','source-link')}</td><td>${!demo?`<button class="delete-target" data-delete="${t.id}" aria-label="${esc(t.broker)} 기록 삭제">×</button>`:''}</td></tr><tr class="target-reason"><td colspan="8">변경 사유 · ${esc(t.reason)}</td></tr>`;
+  }).join('');
+}
+function filteredArticles(articles) {
+  const search = $('#search').value.trim().toLowerCase();
+  const region = $('#region').value;
+  return articles.filter(a => (company==='all'||a.company===company) && (topic==='all'||a.topic===topic) && (region==='all'||a.region===region) && (view!=='reports'||a.report) && (view!=='saved'||saved.has(a.id)) && (!search||(a.title+' '+a.source).toLowerCase().includes(search)));
+}
+function renderNews(articles) {
+  const list = filteredArticles(articles);
+  $('#article-count').textContent = list.length;
+  $('#nav-count').textContent = articles.length;
+  $('#load-more').hidden = list.length<=limit;
+  if (!list.length) {
+    const empty = articles.length || view==='saved';
+    $('#news-list').innerHTML = `<div class="empty-news"><div class="empty-symbol">▤</div><h3>${empty?'조건에 맞는 기사가 없습니다':'아직 도착하지 않은 첫 번째 브리핑'}</h3><p>${view==='saved'?'기사 오른쪽의 ☆ 버튼을 눌러 나중에 읽을 기사를 보관하세요.':empty?'검색어나 기업·주제 필터를 바꿔보세요.':'국내외 주요 소식을 모아 이곳에서 보여드립니다.<br>수집이 완료되면 출처와 발표 시각을 함께 확인할 수 있습니다.'}</p><button data-action="${empty?'reset':'demo'}">${empty?'필터 초기화':'예시 브리핑 살펴보기 ↗'}</button></div>`;
+    return;
+  }
+  $('#news-list').innerHTML = list.slice(0,limit).map((a,i) => `<article class="news-item"><span class="article-index">${String(i+1).padStart(2,'0')}</span><div class="news-content"><div class="article-tags"><span class="company-tag ${a.company==='sk'?'sk-tag':''}">${companies[a.company]}</span><span class="tag-divider">/</span><span class="article-topic">${esc(a.topic)}</span>${a.report?'<span class="report-tag">리포트 관련 기사</span>':''}</div>${demo?`<span class="news-title">${esc(a.title)}</span>`:link(a.url,esc(a.title),'news-title')}<div class="article-meta"><span class="meta-source">${esc(a.source)}</span><span>·</span><span>${esc(a.region)}</span><span>·</span><time datetime="${esc(a.published)}">${dateText(a.published,{hour:'2-digit',minute:'2-digit'})} KST</time>${demo?'<span>· 가상 예시</span>':''}</div></div><div class="article-actions"><button class="save-article ${saved.has(a.id)?'saved':''}" data-save="${esc(a.id)}" aria-label="${saved.has(a.id)?'저장 취소':'기사 저장'}" aria-pressed="${saved.has(a.id)}">${saved.has(a.id)?'★':'☆'}</button>${!demo?link(a.url,'↗'):''}</div></article>`).join('');
+}
+function render() {
+  const source = current();
+  renderStatus(); renderHighlights(source.articles); renderTargets(source.targets); renderNews(source.articles);
+  $('#overview-section').hidden = view !== 'overview';
+  $('#targets-section').hidden = view === 'saved' || view === 'news';
+  const names = {overview:'오늘의 브리핑',news:'전체 뉴스',reports:'증권가 리포트',saved:'저장한 기사'};
+  $('#breadcrumb').textContent = names[view];
+  $('#page-title').innerHTML = view==='overview' ? '반도체의 흐름을, 한눈에<span>.</span>' : esc(names[view])+'<span>.</span>';
+  $('#news-title').textContent = view==='saved'?'나중에 읽을 기사':view==='reports'?'리포트 관련 뉴스':'뉴스 & 인사이트';
+  $$('.nav-item').forEach(b=>{b.classList.toggle('active',b.dataset.view===view);if(b.dataset.view===view)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
+  $$('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.filter===company);b.setAttribute('aria-pressed',b.dataset.filter===company);});
+  $$('.chip').forEach(b=>{b.classList.toggle('active',b.dataset.topic===topic);b.setAttribute('aria-pressed',b.dataset.topic===topic);});
+}
+async function load() {
+  try { const response = await fetch('/api/dashboard'); if(!response.ok) throw new Error(); data = await response.json(); render(); }
+  catch (_) { $('#notice').classList.add('visible'); $('#notice').textContent = '서버에 연결하지 못했습니다. 서버 실행 상태를 확인한 뒤 새로고침하세요.'; }
+}
+document.addEventListener('click', async event => {
+  const b = event.target.closest('button'); if(!b) return;
+  if(b.dataset.view) { view=b.dataset.view; company='all'; topic='all'; limit=15; render(); }
+  if(b.dataset.company) { company=b.dataset.company; view='news'; limit=15; render(); }
+  if(b.dataset.filter) { company=b.dataset.filter; limit=15; render(); }
+  if(b.dataset.topic) { topic=b.dataset.topic; limit=15; render(); }
+  if(b.dataset.action==='demo') { demo=true; render(); }
+  if(b.dataset.action==='reset') { company='all';topic='all';$('#search').value='';$('#region').value='all';render(); }
+  if(b.dataset.save) {
+    const id=b.dataset.save; if(saved.has(id))saved.delete(id);else saved.add(id);
+    try {localStorage.setItem('memory-saved',JSON.stringify([...saved]));} catch (_) {toast('브라우저 저장 공간에 접근할 수 없습니다.');}
+    render();
+  }
+  if(b.dataset.delete && confirm('이 목표주가 기록을 삭제할까요?')) {
+    try { const r=await fetch('/api/targets/'+b.dataset.delete,{method:'DELETE'});if(!r.ok)throw new Error();await load();toast('기록을 삭제했습니다.'); } catch (_) {toast('삭제하지 못했습니다. 다시 시도하세요.');}
+  }
+});
+$('#exit-demo').addEventListener('click',()=>{demo=false;render();});
+$('#search').addEventListener('input',()=>{limit=15;renderNews(current().articles);});
+$('#region').addEventListener('change',()=>{limit=15;renderNews(current().articles);});
+$('#load-more').addEventListener('click',()=>{limit+=15;renderNews(current().articles);});
+$('#refresh').addEventListener('click',async()=>{
+  demo=false;data.collecting=true;render();
+  try {const r=await fetch('/api/refresh',{method:'POST'});if(!r.ok)throw new Error();toast('국내외 뉴스를 수집하고 있습니다.');setTimeout(load,1000);} catch (_) {data.collecting=false;render();toast('수집을 시작하지 못했습니다. 다시 시도하세요.');}
+});
+$('#add-target').addEventListener('click',()=>{
+  if(demo){toast('실제 데이터 화면에서 리포트를 기록해 주세요.');return;}
+  const date = new Date().toLocaleDateString('sv-SE',{timeZone:'Asia/Seoul'});
+  const input=$('[name="published"]');input.value=date;input.max=date;$('#form-error').textContent='';$('#target-dialog').showModal();
+});
+$('#close-dialog').addEventListener('click',()=>$('#target-dialog').close());
+$('#target-form').addEventListener('submit',async event=>{
+  event.preventDefault();const button=$('.form-submit');button.disabled=true;
+  const payload=Object.fromEntries(new FormData(event.target));payload.previous=Number(payload.previous);payload.target=Number(payload.target);
+  try {const r=await fetch('/api/targets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const result=await r.json();if(!r.ok)throw new Error(result.error||'저장에 실패했습니다.');$('#target-dialog').close();event.target.reset();await load();toast('목표주가 기록을 저장했습니다.');}
+  catch(e){$('#form-error').textContent=e.message;}finally{button.disabled=false;}
+});
+document.addEventListener('keydown',e=>{if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('#target-dialog').open){e.preventDefault();$('#search').focus();}});
+render();load();setInterval(load,12000);
