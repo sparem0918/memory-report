@@ -189,6 +189,11 @@ class GeminiTests(unittest.TestCase):
             raw['highlights'][0]['summary']='삼성전자의 '+claim+'입니다.'
             with self.subTest(original=original),self.assertRaises(gemini.OutputError):gemini.validate_output(raw,sources)
 
+    def test_negative_amounts_and_ratios_cannot_be_flipped_positive(self):
+        self.assertEqual(gemini.numeric_claims('변화 -12만원'),gemini.numeric_claims('변화 KRW -120000'))
+        self.assertNotEqual(gemini.numeric_claims('변화 -12만원'),gemini.numeric_claims('변화 12만원'))
+        self.assertNotEqual(gemini.numeric_claims('변화 -20%'),gemini.numeric_claims('변화 20%'))
+
     def test_unverified_numeric_field_is_replaced_and_diagnosed_without_discarding_safe_explanation(self):
         sources=[source()];raw=output(sources)
         for item in raw['highlights']+raw['companies']:item['summary']='삼성전자 목표주가가 999만원입니다.'

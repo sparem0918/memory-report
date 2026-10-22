@@ -191,28 +191,30 @@ def schema(sources=None):
 
 
 NUMBER = r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
-AMOUNT = rf'(?:(?:{NUMBER}\s*[조억만천]\s*)+(?:{NUMBER})?|{NUMBER}(?:\s*(?:trillion|billion|million|thousand)\b)?)'
+AMOUNT = rf'[+\-−]?(?:(?:{NUMBER}\s*[조억만천]\s*)+(?:{NUMBER})?|{NUMBER}(?:\s*(?:trillion|billion|million|thousand)\b)?)'
 CURRENCY = r'US\$|KRW|USD|EUR|JPY|CNY|RMB|₩|\$|€|원|달러|유로|엔|위안'
 MONEY_CLAIM = re.compile(rf'(?<![A-Za-z\d.,])(?:(?P<prefix>{CURRENCY})\s*(?P<first>{AMOUNT})(?![A-Za-z\d]|,\d|\.\d)|(?P<last>{AMOUNT})\s*(?P<suffix>{CURRENCY}))',re.I)
-PERCENT_CLAIM = re.compile(rf'(?<![\d.,])({NUMBER})\s*(?:%|percent\b|퍼센트)',re.I)
+PERCENT_CLAIM = re.compile(rf'(?<![\d.,])([+\-−]?{NUMBER})\s*(?:%|percent\b|퍼센트)',re.I)
 NUMBER_CLAIM = re.compile(rf'(?<![\d.,])({AMOUNT})(?!\d|,\d|\.\d)',re.I)
 
 
 def amount(value):
     """Exact decimal arithmetic for explicit scale labels; never currency conversion."""
     normalized=re.sub(r'\s|,','',value).lower()
+    sign=-1 if normalized.startswith(('-','−')) else 1
+    normalized=normalized.lstrip('+-−')
     with localcontext() as context:
         context.prec=max(32,len(normalized)+16)
         english=re.fullmatch(r'(\d+(?:\.\d+)?)(trillion|billion|million|thousand)',normalized)
         if english:
-            return Decimal(english[1])*{'trillion':10**12,'billion':10**9,'million':10**6,'thousand':1000}[english[2]]
+            return sign*Decimal(english[1])*{'trillion':10**12,'billion':10**9,'million':10**6,'thousand':1000}[english[2]]
         total,last,position=Decimal(0),10**30,0
         for match in re.finditer(r'(\d+(?:\.\d+)?)([조억만천]?)',normalized):
             unit={'조':10**12,'억':10**8,'만':10000,'천':1000,'':1}[match[2]]
             if match.start()!=position or unit>=last:raise ValueError('invalid_quantity')
             total+=Decimal(match[1])*unit;last=unit;position=match.end()
         if position!=len(normalized) or not position:raise ValueError('invalid_quantity')
-        return total
+        return sign*total
 
 
 def numeric_claims(text):
