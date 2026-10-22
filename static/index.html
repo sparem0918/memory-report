@@ -30,7 +30,8 @@
       <div id="demo-banner" class="demo-banner" hidden><span><strong>예시 화면</strong> 아래 기사·목표주가는 화면 설명용 가상 데이터입니다. 실제 투자 정보가 아닙니다.</span><button id="exit-demo">실제 데이터로 돌아가기 ↗</button></div>
 
       <section id="overview-section">
-        <div class="section-heading"><h2><span class="spark">✧</span> 오늘의 핵심 브리핑</h2><span class="section-note">최근 72시간 · 제목 기반 핵심 기사</span></div>
+        <div class="section-heading"><h2><span class="spark">✧</span> 오늘의 핵심 브리핑</h2><span id="briefing-basis" class="section-note">최근 72시간 · 제목 기반 핵심 기사</span></div>
+        <div id="ai-briefing" aria-live="polite"></div>
         <div id="highlights" class="highlights"></div>
         <div class="company-grid" id="company-cards"></div>
       </section>

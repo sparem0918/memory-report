@@ -70,6 +70,21 @@ function renderHighlights(articles) {
     return `<article class="company-card"><div class="company-card-header"><span class="company-avatar ${key==='sk'?'sk':'samsung'}">${key==='sk'?'SK':'S'}</span><div><h3>${name}</h3><span class="stock-code">${key==='sk'?'000660':'005930'} · KOSPI</span></div><button class="company-more" data-company="${key}">소식 보기 ↗</button></div><div class="company-card-content"><div class="company-stat"><small>최근 72시간 수집 기사</small><strong>${items.length}<span>건</span></strong></div><div class="company-topics">${topics.length ? topics.map(t=>`<span class="topic-small">${esc(t)}</span>`).join('') : '<span class="company-no-data">새로운 소식이 모이면<br>주요 주제를 알려드려요.</span>'}</div></div></article>`;
   }).join('');
 }
+function renderAIBriefing() {
+  const expanded = new Set($$('#ai-briefing details[open]').map(node=>node.dataset.record));
+  const ai = demo ? null : data.gemini;
+  const brief = ai?.briefing;
+  $('#highlights').hidden = !!brief;
+  $('#briefing-basis').textContent = brief ? 'Gemini 한국어 요약 · 출처 함께 확인' : '최근 72시간 · 제목 기반 핵심 기사';
+  if (!brief) {
+    $('#ai-briefing').innerHTML = !demo && ai ? `<p class="ai-status" role="status">${esc(ai.message)}</p>` : '';
+    return;
+  }
+  const old = ai.status !== 'ready' || Date.now()-new Date(brief.generated_at).getTime()>24*3600*1000;
+  const sourceLinks = (item,id) => `<details class="ai-sources" data-record="${id}" ${expanded.has(id)?'open':''}><summary>출처 ${item.sources.length}건 · ${item.basis==='title'?'제목 기반':'공개 발췌·제목 기반'}</summary>${item.sources.map(s=>link(s.url,`${esc(s.source)} · ${esc(s.title)} ↗`)).join('')}</details>`;
+  const content = (item,id) => `<h4>${esc(item.title)}</h4><p class="ai-summary">${esc(item.summary)}</p><dl><dt>의미</dt><dd>${esc(item.why_it_matters)}</dd><dt>다음 확인</dt><dd>${esc(item.watch_next)}</dd></dl>${sourceLinks(item,id)}`;
+  $('#ai-briefing').innerHTML = `<div class="ai-intro"><div><span class="ai-label">AI BRIEF${old?' · 이전 요약':''}</span><h3>${esc(brief.headline)}</h3></div><span class="ai-updated">${dateText(brief.generated_at,{hour:'2-digit',minute:'2-digit'})} KST 생성</span></div>${old?`<p class="ai-status" role="status">${esc(ai.status==='ready'?'새 자료가 수집되면 요약을 갱신합니다.':ai.message)} 기존 요약을 표시합니다.</p>`:''}<div class="ai-highlights">${brief.highlights.map((item,i)=>`<article class="ai-card"><span class="ai-number">0${i+1}</span>${content(item,'highlight-'+i)}</article>`).join('')}</div><div class="ai-companies">${brief.companies.map(item=>`<article class="ai-card ai-company"><span class="ai-company-name">${esc(companies[item.company])}</span>${content(item,'company-'+item.company)}</article>`).join('')}</div><p class="footnote ai-footnote">수집된 공개 자료를 AI가 정리한 내용입니다. 제목 기반 요약은 기사 본문을 확인한 결과가 아닙니다. 수치와 해석은 연결된 원문에서 확인하세요.</p>`;
+}
 function renderTargets(targets) {
   const expanded = new Set($$('#targets details[open]').map(node=>node.dataset.record));
   const filter = $('#target-filter').value;
@@ -113,7 +128,7 @@ function renderNews(articles) {
 }
 function render() {
   const source = current();
-  renderStatus(); renderHighlights(source.articles); renderTargets(source.targets); renderNews(source.articles);
+  renderStatus(); renderHighlights(source.articles); renderAIBriefing(); renderTargets(source.targets); renderNews(source.articles);
   $('#overview-section').hidden = view !== 'overview';
   $('#targets-section').hidden = view === 'saved' || view === 'news';
   const names = {overview:'오늘의 브리핑',news:'전체 뉴스',reports:'증권가 리포트',saved:'저장한 기사'};

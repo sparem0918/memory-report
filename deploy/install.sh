@@ -17,6 +17,7 @@ fi
 command -v systemctl >/dev/null || { echo 'A Linux server with systemd is required.' >&2; exit 1; }
 [[ -f "$source_dir/app.py" && -f "$source_dir/static/index.html" ]] || { echo 'Application files are missing.' >&2; exit 1; }
 [[ -f "$source_dir/reports.py" ]] || { echo 'Automatic research extraction module is missing.' >&2; exit 1; }
+[[ -f "$source_dir/gemini.py" ]] || { echo 'Optional Gemini briefing module is missing.' >&2; exit 1; }
 [[ -d "$source_dir/tests" ]] || { echo 'Release tests are missing.' >&2; exit 1; }
 
 # Free OS package for reading the first page of publicly available research PDFs.
@@ -56,6 +57,7 @@ install -d -m 0750 -o memory-brief -g memory-brief /var/lib/memory-brief
 release_dir=$(mktemp -d /opt/memory-brief/releases/release-XXXXXXXX)
 install -m 0644 "$source_dir/app.py" "$release_dir/app.py"
 install -m 0644 "$source_dir/reports.py" "$release_dir/reports.py"
+install -m 0644 "$source_dir/gemini.py" "$release_dir/gemini.py"
 install -m 0644 "$source_dir/README.md" "$release_dir/README.md"
 install -d -m 0755 "$release_dir/static"
 install -m 0644 "$source_dir/static/"* "$release_dir/static/"
@@ -105,6 +107,7 @@ for attempt in range(15):
         print('Application responded; stored articles:', len(data['articles']))
         automatic = [row for row in data['targets'] if row.get('origin') == 'auto']
         print('Automatic target records:', len(automatic), '(unknown values remain marked for review)')
+        print('Gemini briefing:', data['gemini']['status'], '(API keys are never shown)')
         print('Next collection (KST):', data['next_run'])
         if data['collecting']:
             print('RSS collection is still running; check last_run after it finishes.')

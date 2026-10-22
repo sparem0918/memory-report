@@ -12,6 +12,7 @@ WorkingDirectory=/opt/memory-brief/current
 ExecStart=@PYTHON@ /opt/memory-brief/current/app.py --host 127.0.0.1 --port 8000
 Environment=MEMORY_DB=/var/lib/memory-brief/memory.db
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/memory-brief/gemini.env
 StateDirectory=memory-brief
 StateDirectoryMode=0750
 Restart=on-failure

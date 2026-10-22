@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -20,6 +21,8 @@ RSS = b'''<rss><channel><item><title>HBM demand - Test News</title>
 
 class AppTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, {'GEMINI_ENABLED':'0'})
+        environment.start();self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.original_db = app.DB
         app.DB = Path(self.temp.name) / 'test.db'

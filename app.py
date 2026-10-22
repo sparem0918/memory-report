@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import reports
+import gemini
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('MEMORY_DB', str(ROOT / '.data' / 'memory.db')))
@@ -148,8 +149,9 @@ def collect():
                        (started, now(), added, successful, json.dumps(errors, ensure_ascii=False)))
             db.execute("INSERT OR REPLACE INTO settings VALUES ('report_collection',?)",
                        (json.dumps(target_result, ensure_ascii=False),))
+        briefing_result = gemini.refresh(connect)
         return dict(added=added, successful=successful, total=len(FEEDS), errors=errors,
-                    target_collection=target_result)
+                    target_collection=target_result, gemini=briefing_result)
     finally:
         LOCK.release()
 
@@ -254,10 +256,14 @@ def scheduler():
         with connect() as db:
             previous = db.execute("SELECT value FROM settings WHERE key='last_slot'").fetchone()
             report_version = db.execute("SELECT value FROM settings WHERE key='report_version'").fetchone()
-            if previous is None or previous['value'] != slot or report_version is None or report_version['value'] != reports.VERSION:
+            brief_version = db.execute("SELECT value FROM settings WHERE key='gemini_version'").fetchone()
+            needs_brief = gemini.configured() and (brief_version is None or brief_version['value'] != gemini.VERSION)
+            if previous is None or previous['value'] != slot or report_version is None or report_version['value'] != reports.VERSION or needs_brief:
                 if not LOCK.locked():
                     db.execute("INSERT OR REPLACE INTO settings VALUES ('last_slot',?)", (slot,))
                     db.execute("INSERT OR REPLACE INTO settings VALUES ('report_version',?)", (reports.VERSION,))
+                    if gemini.configured():
+                        db.execute("INSERT OR REPLACE INTO settings VALUES ('gemini_version',?)", (gemini.VERSION,))
                     should_run = True
                 else:
                     should_run = False
@@ -283,6 +289,7 @@ def snapshot():
     if run:
         run['errors'] = json.loads(run['errors'])
     return dict(articles=articles, targets=targets, last_run=run,
+                gemini=gemini.snapshot(connect),
                 target_collection=json.loads(report_run['value']) if report_run else None,
                 last_success=last_ok['completed'] if last_ok else None,
                 next_run=next_run().isoformat(), collecting=LOCK.locked(), schedule=['08:00', '18:00'], timezone='Asia/Seoul')
@@ -409,10 +416,15 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--collect', action='store_true', help='Collect once and exit')
+    parser.add_argument('--brief-only', action='store_true', help='Update cached Gemini summary without collecting news')
     parser.add_argument('--no-scheduler', action='store_true')
     args = parser.parse_args()
     init_db()
     backfill_targets()
+    if args.brief_only:
+        result = gemini.refresh(connect)
+        print(json.dumps(result, ensure_ascii=False))
+        raise SystemExit(1 if result['status'] == 'error' else 0)
     if args.collect:
         result = collect()
         print(json.dumps(result, ensure_ascii=False))
